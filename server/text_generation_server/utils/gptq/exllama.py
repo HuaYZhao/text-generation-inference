@@ -37,12 +37,19 @@ def set_device(device):
     DEVICE = device
 
 
-def create_exllama_buffers(max_total_tokens: int):
+def create_exllama_buffers():
     global MAX_DQ, MAX_INNER, ACT_ORDER, DEVICE, TEMP_STATE, TEMP_DQ
 
     assert DEVICE is not None, "call set_device first"
 
-    if not ACT_ORDER:
+    if ACT_ORDER:
+        # TODO: this should be set to rust side `max_total_tokens`, but TGI
+        # does not offer an API to expose this variable to python, as this variable
+        # is handled by the client but it appears the model is initialized by the server.
+        # An alternative could be to initialize the buffers during warmup.
+        # Dummy
+        max_total_tokens = 2048
+    else:
         max_total_tokens = 1
 
     # This temp_state buffer is required to reorder X in the act-order case.

@@ -6,6 +6,7 @@ from transformers.activations import ACT2FN
 from typing import Optional, List, Tuple
 
 from text_generation_server.utils import paged_attention, flash_attn
+from text_generation_server.utils.flash_attn import attention
 from text_generation_server.utils.layers import (
     TensorParallelRowLinear,
     TensorParallelColumnLinear,
@@ -71,7 +72,7 @@ def _load_multi_mqa_gptq(
 
         g_idx = weights.get_tensor(f"{prefix}.c_attn.g_idx")
         g_idx = g_idx.to(device=weights.device)
-        bits, groupsize, _ = weights._get_gptq_params()
+        bits, groupsize = weights._get_gptq_params()
 
         from text_generation_server.utils.layers import HAS_EXLLAMA
 

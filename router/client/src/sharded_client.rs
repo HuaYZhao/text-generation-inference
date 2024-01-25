@@ -1,4 +1,3 @@
-use crate::client::{DecodeTimings, PrefillTimings};
 /// Multi shard Client
 use crate::{Batch, CachedBatch, Client, Generation, HealthResponse, ShardInfo};
 use crate::{ClientError, Result};
@@ -117,65 +116,49 @@ impl ShardedClient {
     ///
     /// Returns Generation for each request in batch
     /// and the next cached batch
-    #[instrument(skip_all, fields(id = & batch.id, size = & batch.size))]
+    #[instrument(skip_all, fields(id = &batch.id, size = &batch.size))]
     pub async fn prefill(
         &mut self,
         batch: Batch,
-    ) -> Result<(Vec<Generation>, Option<CachedBatch>, PrefillTimings)> {
+    ) -> Result<(Vec<Generation>, Option<CachedBatch>)> {
         let futures: Vec<_> = self
             .clients
             .iter_mut()
             .map(|client| Box::pin(client.prefill(batch.clone())))
             .collect();
-        #[allow(clippy::type_complexity)]
-        let results: Result<Vec<(Vec<Generation>, Option<CachedBatch>, PrefillTimings)>> =
+        let results: Result<Vec<(Vec<Generation>, Option<CachedBatch>)>> =
             join_all(futures).await.into_iter().collect();
-        let mut results = results?;
-
-        let (mut generations, next_batch, mut timings) =
-            results.pop().ok_or(ClientError::EmptyResults)?;
-
-        // Merge generations from different model shards
-        for (mut shard_generations, _, shard_timings) in results.into_iter() {
-            generations.append(&mut shard_generations);
-            // Return the timings of the slowest shard
-            if shard_timings.total > timings.total {
-                timings = shard_timings;
-            }
-        }
-        Ok((generations, next_batch, timings))
+        merge_generations(results?)
     }
 
     /// Generate one token for each request in the given cached batches
     ///
     /// Returns Generation for each request in batches
     /// and the next cached batch
-    #[instrument(skip_all, fields(size = batches.iter().map(| batch | {batch.size}).sum::< u32 > ()))]
+    #[instrument(skip_all, fields(size = batches.iter().map(|batch|{batch.size}).sum::<u32>()))]
     pub async fn decode(
         &mut self,
         batches: Vec<CachedBatch>,
-    ) -> Result<(Vec<Generation>, Option<CachedBatch>, DecodeTimings)> {
+    ) -> Result<(Vec<Generation>, Option<CachedBatch>)> {
         let futures: Vec<_> = self
             .clients
             .iter_mut()
             .map(|client| Box::pin(client.decode(batches.clone())))
             .collect();
-        #[allow(clippy::type_complexity)]
-        let results: Result<Vec<(Vec<Generation>, Option<CachedBatch>, DecodeTimings)>> =
+        let results: Result<Vec<(Vec<Generation>, Option<CachedBatch>)>> =
             join_all(futures).await.into_iter().collect();
-        let mut results = results?;
-
-        let (mut generations, next_batch, mut timings) =
-            results.pop().ok_or(ClientError::EmptyResults)?;
-
-        // Merge generations from different model shards
-        for (mut shard_generations, _, shard_timings) in results.into_iter() {
-            generations.append(&mut shard_generations);
-            // Return the timings of the slowest shard
-            if shard_timings.total > timings.total {
-                timings = shard_timings;
-            }
-        }
-        Ok((generations, next_batch, timings))
+        merge_generations(results?)
     }
+}
+
+/// Merge generations from the different model shards
+fn merge_generations(
+    mut results: Vec<(Vec<Generation>, Option<CachedBatch>)>,
+) -> Result<(Vec<Generation>, Option<CachedBatch>)> {
+    let (mut generations, next_batch) = results.pop().ok_or(ClientError::EmptyResults)?;
+
+    for (mut shard_generations, _) in results.into_iter() {
+        generations.append(&mut shard_generations);
+    }
+    Ok((generations, next_batch))
 }

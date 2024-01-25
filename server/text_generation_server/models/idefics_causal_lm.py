@@ -1,11 +1,17 @@
 import torch
-import time
+import inspect
+import re
+from io import BytesIO
+import base64
+from PIL import Image
+import re
 
 from dataclasses import dataclass
 from opentelemetry import trace
 from transformers import (
     AutoProcessor,
     AutoTokenizer,
+    AutoModelForCausalLM,
     PreTrainedTokenizerBase,
     ProcessorMixin,
 )
@@ -14,7 +20,7 @@ from typing import Optional, Tuple, List, Type, Dict
 from text_generation_server.models import Model
 from text_generation_server.models.types import (
     Batch,
-    Tokens,
+    PrefillTokens,
     Generation,
     GeneratedText,
 )
@@ -577,7 +583,7 @@ class IdeficsCausalLM(Model):
 
         if torch.cuda.is_available():
             device = torch.device("cuda")
-            dtype = torch.bfloat16 if dtype is None else dtype
+            dtype = torch.float16 if dtype is None else dtype
         else:
             if quantize:
                 raise ValueError("quantization is not available on CPU")
@@ -664,8 +670,7 @@ class IdeficsCausalLM(Model):
     @tracer.start_as_current_span("generate_token")
     def generate_token(
         self, batch: IdeficsCausalLMBatch
-    ) -> Tuple[List[Generation], Optional[IdeficsCausalLMBatch], Tuple[int, int]]:
-        start = time.time_ns()
+    ) -> Tuple[List[Generation], Optional[IdeficsCausalLMBatch]]:
         # slice the attention mask to the correct shape
         attention_mask = batch.attention_mask[:, : -batch.padding_right_offset]
         if batch.input_ids.size(1) == 1:
@@ -693,8 +698,6 @@ class IdeficsCausalLM(Model):
         )
         # Hardcoded remove image tokens
         logits[:, 32000:32001] = torch.finfo(logits.dtype).min
-
-        start_decode = time.time_ns()
 
         # Results
         generations: List[Generation] = []
@@ -788,11 +791,8 @@ class IdeficsCausalLM(Model):
                         clean_up_tokenization_spaces=False,
                         skip_special_tokens=False,
                     )
-                    prefill_tokens = Tokens(
-                        prefill_token_ids,
-                        prefill_logprobs,
-                        prefill_texts,
-                        is_special=[],
+                    prefill_tokens = PrefillTokens(
+                        prefill_token_ids, prefill_logprobs, prefill_texts
                     )
                 else:
                     prefill_tokens = None
@@ -802,12 +802,10 @@ class IdeficsCausalLM(Model):
                 generation = Generation(
                     request.id,
                     prefill_tokens,
-                    Tokens(
-                        [next_token_id_squeezed],
-                        [next_token_logprob],
-                        [next_token_text],
-                        [next_token_id_squeezed.item() in self.all_special_ids],
-                    ),
+                    next_token_id_squeezed,
+                    next_token_logprob,
+                    next_token_text,
+                    next_token_id_squeezed.item() in self.all_special_ids,
                     generated_text,
                     top_tokens,
                 )
@@ -824,9 +822,7 @@ class IdeficsCausalLM(Model):
 
         # We finished all generations in the batch; there is no next batch
         if stopped:
-            forward_ns = start_decode - start
-            decode_ns = time.time_ns() - start_decode
-            return generations, None, (forward_ns, decode_ns)
+            return generations, None
 
         # Slice unused values from prefill
         batch.input_ids = batch.input_ids[:, :1]
@@ -846,6 +842,4 @@ class IdeficsCausalLM(Model):
         batch.past_key_values = past
         batch.image_hidden_states = image_hidden_states
 
-        forward_ns = start_decode - start
-        decode_ns = time.time_ns() - start_decode
-        return generations, batch, (forward_ns, decode_ns)
+        return generations, batch

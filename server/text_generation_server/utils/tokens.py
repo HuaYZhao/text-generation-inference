@@ -92,7 +92,7 @@ class NextTokenChooser:
 class StopSequenceCriteria:
     def __init__(self, stop_sequence: str):
         stop_sequence = re.escape(stop_sequence)
-        self.regex = re.compile(f"{stop_sequence}$")
+        self.regex = re.compile(f".*{stop_sequence}$")
 
     def __call__(self, output: str) -> bool:
         if self.regex.findall(output):
@@ -123,15 +123,10 @@ class StoppingCriteria:
         if not self.ignore_eos_token and last_token == self.eos_token_id:
             return True, FinishReason.FINISH_REASON_EOS_TOKEN
 
-        if self.stop_sequence_criterias:
-            self.current_output += last_output
-            # There is no need to keep an output that is too long
-            if len(self.current_output) > 300:
-                # Slice to -200 to avoid doing it all the time
-                self.current_output = self.current_output[-200:]
-            for stop_sequence_criteria in self.stop_sequence_criterias:
-                if stop_sequence_criteria(self.current_output):
-                    return True, FinishReason.FINISH_REASON_STOP_SEQUENCE
+        self.current_output += last_output
+        for stop_sequence_criteria in self.stop_sequence_criterias:
+            if stop_sequence_criteria(self.current_output):
+                return True, FinishReason.FINISH_REASON_STOP_SEQUENCE
 
         return False, None
 
@@ -150,30 +145,6 @@ class StoppingCriteria:
             pb.max_new_tokens,
             pb.ignore_eos_token,
         )
-
-
-def create_n_gram_speculation(
-    input_ids: torch.Tensor,
-    next_ids: torch.Tensor,
-    accepted_ids: torch.Tensor,
-    speculate: int,
-    verbose: bool,
-):
-    # Very trivial approach, find first match in the string.
-    # This is much less refined than actual n-gram but seems to work
-    # relatively OK in grounded mode and is by far much faster with
-    # much less worst case complexity as everything happens on device.
-    B = accepted_ids.shape[0]
-    device = input_ids.device
-    seeds = next_ids[accepted_ids.cumsum(dim=-1) - 1]
-    indices = (input_ids == seeds.unsqueeze(-1)).max(dim=1).indices + 1
-    all_indices = indices.unsqueeze(-1).expand(B, speculate) + torch.arange(
-        speculate, device=device
-    )
-    all_indices = torch.clamp(all_indices, max=input_ids.shape[1] - 1)
-
-    speculative_ids = input_ids.gather(dim=-1, index=all_indices)
-    return speculative_ids
 
 
 class HeterogeneousNextTokenChooser:
@@ -244,90 +215,20 @@ class HeterogeneousNextTokenChooser:
         self.dtype = dtype
         self.device = device
 
-    def __call__(
-        self,
-        input_ids: torch.Tensor,
-        scores: torch.Tensor,
-        speculate: int,
-        speculated_ids: Optional[torch.Tensor] = None,
-        speculative_scores: Optional[torch.Tensor] = None,
-        verbose=False,
-    ):
-        if speculated_ids is not None:
-            B = scores.shape[0] // (speculated_ids.shape[1] + 1)
-            S = speculated_ids.shape[1] + 1
-            scores = scores.view(B, S, -1)
-        else:
-            B = scores.shape[0]
-            S = 1
-            scores = scores.view(B, S, -1)
+    def __call__(self, input_ids: torch.Tensor, scores: torch.Tensor):
+        if self.watermark_processor is not None:
+            scores = self.watermark_processor(input_ids, scores)
+        if self.repetition_processor is not None:
+            scores = self.repetition_processor(input_ids, scores)
 
-        next_ids = torch.zeros((B, S), device=scores.device, dtype=torch.long)
-        for j in range(S):
-            _scores = scores[:, j]
-            if self.watermark_processor is not None:
-                _scores = self.watermark_processor(input_ids, _scores)
-            if self.repetition_processor is not None:
-                _scores = self.repetition_processor(input_ids, _scores)
+        for warper in self.warpers:
+            scores = warper(input_ids, scores)
 
-            for warper in self.warpers:
-                _scores = warper(input_ids, _scores)
-
-            _next_ids = self.choice(_scores)
-            scores[:, j] = _scores
-            next_ids[:, j] = _next_ids
-        next_ids = next_ids.view(B * S)
-        scores = scores.view(B * S, -1)
-
-        if speculated_ids is not None:
-            accepted_ids = []
-            B = next_ids.shape[0] // (speculated_ids.shape[1] + 1)
-            S = speculated_ids.shape[1] + 1
-            indices = []
-            for i in range(B):
-                _next_ids = next_ids[i * S : (i + 1) * S]
-                _speculated_ids = speculated_ids[i]
-                validate_speculative = _next_ids[:-1] == _speculated_ids
-                index = i * S
-                accepted = 1
-                # First is always valid
-                indices.append(index)
-                for valid in validate_speculative.tolist():
-                    if valid:
-                        index += 1
-                        accepted += 1
-                        indices.append(index)
-                    else:
-                        break
-                accepted_ids.append(accepted)
-
-            accepted_ids = torch.tensor(
-                accepted_ids, device=input_ids.device, dtype=input_ids.dtype
-            )
-            next_ids = next_ids[indices]
-            scores = scores[indices]
-            indices = torch.arange(B, device=input_ids.device) * S
-            if speculative_scores is not None:
-                speculative_scores = speculative_scores[indices + accepted_ids - 1]
-        else:
-            accepted_ids = torch.ones_like(next_ids)
-
+        next_ids = self.choice(scores)
         logprobs = torch.log_softmax(scores, -1)
         next_logprobs = torch.gather(logprobs, 1, next_ids.view(-1, 1)).view(-1)
 
-        if speculate > 0:
-            if speculative_scores is not None:
-                # Medusa provided some scores
-                speculative_ids = Greedy()(speculative_scores)
-            else:
-                # n-gram
-                speculative_ids = create_n_gram_speculation(
-                    input_ids, next_ids, accepted_ids, speculate, verbose
-                )
-        else:
-            speculative_ids = None
-
-        return next_ids, next_logprobs, logprobs, accepted_ids, speculative_ids
+        return next_ids, next_logprobs, logprobs
 
     def filter(self, indices):
         if self.watermark_processor is not None:

@@ -26,7 +26,11 @@ from transformers.activations import ACT2FN
 from transformers.configuration_utils import PretrainedConfig
 from typing import Optional, List, Tuple
 
+# Flash attention imports
+import dropout_layer_norm
+
 from text_generation_server.utils import paged_attention, flash_attn
+from text_generation_server.utils.flash_attn import attention, HAS_FLASH_ATTN_V2
 from text_generation_server.utils.layers import (
     TensorParallelRowLinear,
     TensorParallelColumnLinear,
@@ -34,8 +38,10 @@ from text_generation_server.utils.layers import (
     PositionRotaryEmbedding,
     TensorParallelHead,
     get_linear,
-    FastRMSNorm,
 )
+
+if not HAS_FLASH_ATTN_V2:
+    raise ImportError("Mistral model requires flash attn v2")
 
 
 class MistralConfig(PretrainedConfig):
@@ -60,7 +66,7 @@ class MistralConfig(PretrainedConfig):
         pretraining_tp=1,
         tie_word_embeddings=False,
         rope_theta=10000.0,
-        sliding_window=None,
+        sliding_window=4096,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -90,6 +96,59 @@ class MistralConfig(PretrainedConfig):
             tie_word_embeddings=tie_word_embeddings,
             **kwargs,
         )
+
+
+class MistralRMSNorm(nn.Module):
+    def __init__(self, prefix, weights, eps=1e-6):
+        """
+        LlamaRMSNorm is equivalent to T5LayerNorm
+        """
+        super().__init__()
+
+        weight = weights.get_tensor(f"{prefix}.weight")
+        self.weight = nn.Parameter(weight)
+        self.variance_epsilon = eps
+
+    def forward(self, hidden_states, residual=None):
+        if hidden_states.shape[-1] > 8192:
+            if residual is not None:
+                hidden_states += residual
+            residual = hidden_states
+
+            hidden_states = hidden_states.to(torch.float32)
+            variance = hidden_states.pow(2).mean(-1, keepdim=True)
+            hidden_states = hidden_states * torch.rsqrt(
+                variance + self.variance_epsilon
+            )
+
+            # convert into half-precision if necessary
+            if self.weight.dtype in [torch.float16, torch.bfloat16]:
+                hidden_states = hidden_states.to(self.weight.dtype)
+
+            return self.weight * hidden_states, residual
+        else:
+            # faster post attention rms norm
+            normed_hidden_states, res, *rest = dropout_layer_norm.dropout_add_ln_fwd(
+                hidden_states,
+                residual,
+                self.weight,
+                None,
+                None,
+                None,
+                None,
+                None,
+                0.0,
+                self.variance_epsilon,
+                1.0,
+                0,
+                None,
+                False,
+                True,  # Activate RMSNorm
+            )
+            if res is None:
+                res = hidden_states
+
+            return normed_hidden_states, res
 
 
 def load_attention(config, prefix, weights):
@@ -140,7 +199,7 @@ class MistralAttention(torch.nn.Module):
     ):
         super().__init__()
         self.max_past = (
-            config.sliding_window if config.sliding_window is not None else -1
+            config.sliding_window if config.sliding_window is not None else 0
         )
         self.num_heads = config.num_attention_heads
         self.hidden_size = config.hidden_size
@@ -202,7 +261,8 @@ class MistralAttention(torch.nn.Module):
         query = query.view(-1, self.num_heads, self.head_size)
         kv = kv.view(-1, 2, self.num_key_value_heads, self.head_size)
 
-        self.rotary_emb(query, torch.select(kv, dim=1, index=0), cos, sin)
+        self.rotary_emb(query, cos, sin)
+        self.rotary_emb(torch.select(kv, dim=1, index=0), cos, sin)
 
         if prefill_cache_indices is not None:
             kv_to_cache = kv[prefill_cache_indices]
@@ -293,10 +353,10 @@ class MistralLayer(nn.Module):
         )
         self.mlp = MistralMLP(prefix=f"{prefix}.mlp", config=config, weights=weights)
 
-        self.input_layernorm = FastRMSNorm.load(
+        self.input_layernorm = MistralRMSNorm(
             prefix=f"{prefix}.input_layernorm", weights=weights, eps=config.rms_norm_eps
         )
-        self.post_attention_layernorm = FastRMSNorm.load(
+        self.post_attention_layernorm = MistralRMSNorm(
             prefix=f"{prefix}.post_attention_layernorm",
             weights=weights,
             eps=config.rms_norm_eps,
@@ -362,7 +422,7 @@ class MistralModel(torch.nn.Module):
                 for layer_id in range(config.num_hidden_layers)
             ]
         )
-        self.norm = FastRMSNorm.load(
+        self.norm = MistralRMSNorm(
             prefix="model.norm", weights=weights, eps=config.rms_norm_eps
         )
 
@@ -382,7 +442,6 @@ class MistralModel(torch.nn.Module):
         slots: torch.Tensor,
         input_lengths: torch.Tensor,
         max_s: int,
-        true_max_s: int,
         prefill_cache_indices: Optional[torch.Tensor],
     ) -> torch.Tensor:
         hidden_states = self.embed_tokens(input_ids)
@@ -390,7 +449,7 @@ class MistralModel(torch.nn.Module):
         # Get rotary cos and sin for this forward
         # Avoid to index in each layer
         cos, sin = self.layers[0].self_attn.rotary_emb.get_cos_sin(
-            position_ids, true_max_s, hidden_states.dtype
+            position_ids, max_s, hidden_states.dtype
         )
 
         residual = None
@@ -425,6 +484,8 @@ class FlashMistralForCausalLM(torch.nn.Module):
             weights=weights,
         )
         self.max_past = config.sliding_window
+        if self.max_past is None:
+            raise ValueError("max_past cannot be None")
 
     def forward(
         self,
@@ -439,11 +500,10 @@ class FlashMistralForCausalLM(torch.nn.Module):
         prefill_cache_indices: Optional[torch.Tensor],
         lm_head_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        true_max_s = max_s
         if prefill_cache_indices is not None:
             # Slots also need to be sliced as it has the same size as the whole kv tensor
             slots = slots[prefill_cache_indices]
-        elif self.max_past is not None:
+        else:
             # Clamp in decode mode as paged attention requires clamped values whereas the flash attention
             # kernel requires the true values
             max_s = min(self.max_past, max_s)
@@ -458,7 +518,6 @@ class FlashMistralForCausalLM(torch.nn.Module):
             slots,
             input_lengths,
             max_s,
-            true_max_s,
             prefill_cache_indices,
         )
         if lm_head_indices is not None:
