@@ -1,0 +1,56 @@
+# 网络问题，自己编译失败率极高，建议直接使用1.3.4版本已针对编译好的可执行文件
+# FROM lukemathwalker/cargo-chef:latest-rust-1.71 AS chef
+# WORKDIR /app
+
+# COPY . .
+# RUN make install-launcher
+# 移动到相应目录
+
+FROM nvidia/cuda:12.1.0-devel-ubuntu20.04 AS cuda
+
+FROM ghcr.nju.edu.cn/huggingface/text-generation-inference:1.3.4 AS base
+WORKDIR /app
+ENV CONDA_PKG_PREFIX=/opt/conda/lib/python3.10/site-packages \
+    PY_DIR=server/text_generation_server \
+    LAUNCHER_FILE=text-generation-launcher-134-nccl
+
+COPY comm_lib comm_lib
+COPY $PY_DIR/server.py $CONDA_PKG_PREFIX/text_generation_server/
+COPY $PY_DIR/models/flash_llama.py $CONDA_PKG_PREFIX/text_generation_server/models/
+COPY $PY_DIR/models/custom_modeling/flash_llama_modeling.py $CONDA_PKG_PREFIX/text_generation_server/models/custom_modeling/
+COPY $PY_DIR/utils/layers.py $PY_DIR/utils/mpi_dist.py $CONDA_PKG_PREFIX/text_generation_server/utils/
+COPY bin/$LAUNCHER_FILE /usr/local/bin
+
+# 配置apt
+RUN apt-get update && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends wget git vim ssh libxml2 && \
+    rm -rf /etc/apt/sources.list.d
+# 安装openmpi
+RUN wget https://download.open-mpi.org/release/open-mpi/v4.1/openmpi-4.1.6.tar.bz2 && \
+    tar -xjvf openmpi-4.1.6.tar.bz2 && \
+    cd openmpi-4.1.6 && ./configure --prefix=/usr/local && make all && make install
+# 安装nccl
+RUN wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2004/x86_64/cuda-keyring_1.0-1_all.deb && \
+    dpkg -i cuda-keyring_1.0-1_all.deb && \
+    apt-get update && \
+    apt install libnccl2=2.18.3-1+cuda12.1 libnccl-dev=2.18.3-1+cuda12.1 && \
+    rm -rf /var/lib/apt/lists/*
+RUN pip install mpi4py
+
+FROM base AS optim
+WORKDIR /app
+COPY --from=cuda /usr/local/cuda-12.1 /usr/local/cuda-12.1
+
+# 安装通信优化py包
+RUN cd comm_lib && python setup.py install
+
+FROM base
+WORKDIR /app
+COPY --from=optim $CONDA_PKG_PREFIX/comm_lib* $CONDA_PKG_PREFIX/
+
+# 删除过期文件，减小镜像大小
+RUN mv /usr/local/bin/text-generation-launcher /usr/local/bin/text-generation-launcher-ori && \
+    mv /usr/local/bin/$LAUNCHER_FILE /usr/local/bin/text-generation-launcher && \
+    chmod +x /usr/local/bin/text-generation-launcher && \
+    rm -rf /app
+WORKDIR /usr/src

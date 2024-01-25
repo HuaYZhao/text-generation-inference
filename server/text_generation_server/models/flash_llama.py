@@ -16,9 +16,10 @@ from text_generation_server.utils import (
     weight_files,
     Weights,
 )
+import os
 
 tracer = trace.get_tracer(__name__)
-
+from text_generation_server.utils.mpi_dist import initialize_distributed, barrier
 
 class FlashLlama(FlashCausalLM):
     def __init__(
@@ -30,7 +31,7 @@ class FlashLlama(FlashCausalLM):
         trust_remote_code: bool = False,
         use_medusa: Optional[str] = None,
     ):
-        self.process_group, rank, world_size = initialize_torch_distributed()
+        self.process_group, rank, world_size, comm = initialize_distributed()
         if torch.cuda.is_available():
             device = torch.device(f"cuda:{rank}")
             dtype = torch.float16 if dtype is None else dtype
@@ -38,6 +39,7 @@ class FlashLlama(FlashCausalLM):
             raise NotImplementedError("FlashLlama is only available on GPU")
 
         try:
+            raise
             tokenizer = LlamaTokenizer.from_pretrained(
                 model_id,
                 revision=revision,
@@ -59,7 +61,7 @@ class FlashLlama(FlashCausalLM):
         )
         config.quantize = quantize
 
-        torch.distributed.barrier(group=self.process_group)
+        barrier(comm, self.process_group)
 
         filenames = weight_files(model_id, revision=revision, extension=".safetensors")
         weights = Weights(filenames, device, dtype, process_group=self.process_group)
@@ -98,7 +100,7 @@ class FlashLlama(FlashCausalLM):
             lm_head = model.lm_head
             model.lm_head = MedusaModel(config, weights, lm_head)
 
-        torch.distributed.barrier(group=self.process_group)
+        barrier(comm, self.process_group)
         super(FlashLlama, self).__init__(
             model=model,
             tokenizer=tokenizer,
