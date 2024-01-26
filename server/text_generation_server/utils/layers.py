@@ -1,6 +1,5 @@
 import os
 import torch
-import torch.distributed
 
 from torch import nn
 from torch.nn import functional as F
@@ -52,7 +51,9 @@ try:
     HAS_EETQ = True
 except ImportError:
     pass
+from text_generation_server.utils.mpi_dist import allreduce, allgather_into_tensor
 
+USE_LM_HEAD_PARALLEL = int(os.getenv("USE_LM_HEAD_PARALLEL", "1"))
 
 # Monkey patching
 @classmethod
@@ -365,6 +366,7 @@ class TensorParallelHead(SuperLayer):
                 # just load the entire thing.
                 weight = weights.get_tensor(f"{prefix}.weight")
                 should_gather = False
+                logger.info("Disabled lm head parallel! ")
         else:
             weight = weights.get_tensor(f"{prefix}.weight")
             should_gather = False
@@ -399,14 +401,13 @@ class TensorParallelHead(SuperLayer):
 
             torch.mm(input, self.linear.weight.T, out=local_out)
 
-            torch.distributed.all_gather_into_tensor(
-                world_out, gather_input, group=self.process_group
-            )
+            allgather_into_tensor(world_out, gather_input, self.process_group)
 
             if input.shape[0] == 1:
                 return world_out
             return world_out.T
 
+        assert USE_CUSTOM_NCCL == 0, "should not be here for llama with custom nccl"
         output = super().forward(input)
         world_output = [
             torch.empty_like(output) for _ in range(self.process_group.size())
@@ -469,7 +470,7 @@ class TensorParallelRowLinear(SuperLayer):
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         out = super().forward(input)
         if self.process_group.size() > 1:
-            torch.distributed.all_reduce(out, group=self.process_group)
+            allreduce(out, process_group=self.process_group)
         return out
 
 
@@ -504,7 +505,7 @@ class TensorParallelEmbedding(nn.Module):
         )
         out = torch.nn.functional.embedding(input, self.weight)
         if self.reduce and self.process_group.size() > 1:
-            torch.distributed.all_reduce(out, group=self.process_group)
+            allreduce(out, process_group=self.process_group)
         return out
 
 

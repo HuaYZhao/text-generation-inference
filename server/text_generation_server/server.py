@@ -126,6 +126,13 @@ class TextGenerationService(generate_pb2_grpc.TextGenerationServiceServicer):
             batch=next_batch.to_pb() if next_batch else None,
         )
 
+def get_mpi_server_url(unix_socket_template, uds_path):
+    server_urls = [
+        unix_socket_template.format(uds_path, rank)
+        for rank in range(int(os.environ["OMPI_COMM_WORLD_SIZE"]))
+    ]
+    local_url = server_urls[int(os.environ["OMPI_COMM_WORLD_RANK"])]
+    return server_urls, local_url
 
 def serve(
     model_id: str,
@@ -144,6 +151,7 @@ def serve(
         dtype: Optional[str] = None,
         trust_remote_code: bool = False,
     ):
+        logger.info(os.environ)
         unix_socket_template = "unix://{}-{}"
         if sharded:
             server_urls = [
@@ -154,6 +162,9 @@ def serve(
         else:
             local_url = unix_socket_template.format(uds_path, 0)
             server_urls = [local_url]
+        
+        if int(os.environ.get("USE_CUSTOM_NCCL", 1)):
+            server_urls, local_url = get_mpi_server_url(unix_socket_template, uds_path)
 
         try:
             model = get_model(
