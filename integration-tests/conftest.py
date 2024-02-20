@@ -16,14 +16,7 @@ from syrupy.extensions.json import JSONSnapshotExtension
 from aiohttp import ClientConnectorError, ClientOSError, ServerDisconnectedError
 
 from text_generation import AsyncClient
-from text_generation.types import (
-    Response,
-    Details,
-    InputToken,
-    Token,
-    BestOfSequence,
-    Grammar,
-)
+from text_generation.types import Response, Details, InputToken, Token, BestOfSequence
 
 DOCKER_IMAGE = os.getenv("DOCKER_IMAGE", None)
 HUGGING_FACE_HUB_TOKEN = os.getenv("HUGGING_FACE_HUB_TOKEN", None)
@@ -31,8 +24,6 @@ DOCKER_VOLUME = os.getenv("DOCKER_VOLUME", "/data")
 
 
 class ResponseComparator(JSONSnapshotExtension):
-    rtol = 0.2
-
     def serialize(
         self,
         data,
@@ -67,7 +58,7 @@ class ResponseComparator(JSONSnapshotExtension):
             return (
                 token.id == other.id
                 and token.text == other.text
-                and math.isclose(token.logprob, other.logprob, rel_tol=self.rtol)
+                and math.isclose(token.logprob, other.logprob, rel_tol=0.2)
                 and token.special == other.special
             )
 
@@ -77,9 +68,7 @@ class ResponseComparator(JSONSnapshotExtension):
                     prefill_token.id == other.id
                     and prefill_token.text == other.text
                     and (
-                        math.isclose(
-                            prefill_token.logprob, other.logprob, rel_tol=self.rtol
-                        )
+                        math.isclose(prefill_token.logprob, other.logprob, rel_tol=0.2)
                         if prefill_token.logprob is not None
                         else prefill_token.logprob == other.logprob
                     )
@@ -159,11 +148,6 @@ class ResponseComparator(JSONSnapshotExtension):
         )
 
 
-class GenerousResponseComparator(ResponseComparator):
-    # Needed for GPTQ with exllama which has serious numerical fluctuations.
-    rtol = 0.75
-
-
 class LauncherHandle:
     def __init__(self, port: int):
         self.client = AsyncClient(f"http://localhost:{port}")
@@ -210,11 +194,6 @@ def response_snapshot(snapshot):
     return snapshot.use_extension(ResponseComparator)
 
 
-@pytest.fixture
-def generous_response_snapshot(snapshot):
-    return snapshot.use_extension(GenerousResponseComparator)
-
-
 @pytest.fixture(scope="module")
 def event_loop():
     loop = asyncio.get_event_loop()
@@ -231,8 +210,6 @@ def launcher(event_loop):
         quantize: Optional[str] = None,
         trust_remote_code: bool = False,
         use_flash_attention: bool = True,
-        disable_grammar_support: bool = False,
-        dtype: Optional[str] = None,
     ):
         port = random.randint(8000, 10_000)
         master_port = random.randint(10_000, 20_000)
@@ -255,16 +232,11 @@ def launcher(event_loop):
 
         env = os.environ
 
-        if disable_grammar_support:
-            args.append("--disable-grammar-support")
         if num_shard is not None:
             args.extend(["--num-shard", str(num_shard)])
         if quantize is not None:
             args.append("--quantize")
             args.append(quantize)
-        if dtype is not None:
-            args.append("--dtype")
-            args.append(dtype)
         if trust_remote_code:
             args.append("--trust-remote-code")
 
@@ -297,23 +269,16 @@ def launcher(event_loop):
         quantize: Optional[str] = None,
         trust_remote_code: bool = False,
         use_flash_attention: bool = True,
-        disable_grammar_support: bool = False,
-        dtype: Optional[str] = None,
     ):
         port = random.randint(8000, 10_000)
 
         args = ["--model-id", model_id, "--env"]
 
-        if disable_grammar_support:
-            args.append("--disable-grammar-support")
         if num_shard is not None:
             args.extend(["--num-shard", str(num_shard)])
         if quantize is not None:
             args.append("--quantize")
             args.append(quantize)
-        if dtype is not None:
-            args.append("--dtype")
-            args.append(dtype)
         if trust_remote_code:
             args.append("--trust-remote-code")
 
@@ -330,10 +295,7 @@ def launcher(event_loop):
 
         gpu_count = num_shard if num_shard is not None else 1
 
-        env = {
-            "LOG_LEVEL": "info,text_generation_router=debug",
-            "ENABLE_CUDA_GRAPHS": "true",
-        }
+        env = {"LOG_LEVEL": "info,text_generation_router=debug"}
         if not use_flash_attention:
             env["USE_FLASH_ATTENTION"] = "false"
 
@@ -356,7 +318,6 @@ def launcher(event_loop):
             ],
             volumes=volumes,
             ports={"80/tcp": port},
-            shm_size="1G",
         )
 
         yield ContainerLauncherHandle(client, container.name, port)
@@ -383,22 +344,11 @@ def launcher(event_loop):
 @pytest.fixture(scope="module")
 def generate_load():
     async def generate_load_inner(
-        client: AsyncClient,
-        prompt: str,
-        max_new_tokens: int,
-        n: int,
-        seed: Optional[int] = None,
-        grammar: Optional[Grammar] = None,
-        stop_sequences: Optional[List[str]] = None,
+        client: AsyncClient, prompt: str, max_new_tokens: int, n: int
     ) -> List[Response]:
         futures = [
             client.generate(
-                prompt,
-                max_new_tokens=max_new_tokens,
-                decoder_input_details=True,
-                seed=seed,
-                grammar=grammar,
-                stop_sequences=stop_sequences,
+                prompt, max_new_tokens=max_new_tokens, decoder_input_details=True
             )
             for _ in range(n)
         ]

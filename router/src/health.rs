@@ -1,6 +1,5 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use text_generation_client::GrammarType as ProtoGrammarType;
 use text_generation_client::{
     Batch, NextTokenChooserParameters, Request, ShardedClient, StoppingCriteriaParameters,
 };
@@ -44,17 +43,13 @@ impl Health {
                     do_sample: false,
                     seed: 0,
                     repetition_penalty: 1.0,
-                    frequency_penalty: 0.0,
                     watermark: false,
-                    grammar: String::new(),
-                    grammar_type: ProtoGrammarType::None as i32,
                 }),
                 stopping_parameters: Some(StoppingCriteriaParameters {
                     max_new_tokens: 1,
                     stop_sequences: vec![],
                     ignore_eos_token: false,
                 }),
-                top_n_tokens: 0,
             };
             let batch = Batch {
                 id: BATCH_ID,

@@ -1,22 +1,8 @@
 from enum import Enum
 from pydantic import BaseModel, validator
-from typing import Optional, List, Union
+from typing import Optional, List
 
 from text_generation.errors import ValidationError
-
-
-# enum for grammar type
-class GrammarType(str, Enum):
-    Json = "json"
-    Regex = "regex"
-
-
-# Grammar type and value
-class Grammar(BaseModel):
-    # Grammar type
-    type: GrammarType
-    # Grammar value
-    value: Union[str, dict]
 
 
 class Parameters(BaseModel):
@@ -32,31 +18,27 @@ class Parameters(BaseModel):
     # Stop generating tokens if a member of `stop_sequences` is generated
     stop: List[str] = []
     # Random sampling seed
-    seed: Optional[int] = None
+    seed: Optional[int]
     # The value used to module the logits distribution.
-    temperature: Optional[float] = None
+    temperature: Optional[float]
     # The number of highest probability vocabulary tokens to keep for top-k-filtering.
-    top_k: Optional[int] = None
+    top_k: Optional[int]
     # If set to < 1, only the smallest set of most probable tokens with probabilities that add up to `top_p` or
     # higher are kept for generation.
-    top_p: Optional[float] = None
+    top_p: Optional[float]
     # truncate inputs tokens to the given size
-    truncate: Optional[int] = None
+    truncate: Optional[int]
     # Typical Decoding mass
     # See [Typical Decoding for Natural Language Generation](https://arxiv.org/abs/2202.00666) for more information
-    typical_p: Optional[float] = None
+    typical_p: Optional[float]
     # Generate best_of sequences and return the one if the highest token logprobs
-    best_of: Optional[int] = None
+    best_of: Optional[int]
     # Watermarking with [A Watermark for Large Language Models](https://arxiv.org/abs/2301.10226)
     watermark: bool = False
     # Get generation details
     details: bool = False
     # Get decoder input token logprobs and ids
     decoder_input_details: bool = False
-    # Return the N most likely tokens at each step
-    top_n_tokens: Optional[int] = None
-    # grammar to use for generation
-    grammar: Optional[Grammar] = None
 
     @validator("best_of")
     def valid_best_of(cls, field_value, values):
@@ -119,27 +101,12 @@ class Parameters(BaseModel):
             raise ValidationError("`typical_p` must be > 0.0 and < 1.0")
         return v
 
-    @validator("top_n_tokens")
-    def valid_top_n_tokens(cls, v):
-        if v is not None and v <= 0:
-            raise ValidationError("`top_n_tokens` must be strictly positive")
-        return v
-
-    @validator("grammar")
-    def valid_grammar(cls, v):
-        if v is not None:
-            if v.type == GrammarType.Regex and not v.value:
-                raise ValidationError("`value` cannot be empty for `regex` grammar")
-            if v.type == GrammarType.Json and not v.value:
-                raise ValidationError("`value` cannot be empty for `json` grammar")
-        return v
-
 
 class Request(BaseModel):
     # Prompt
     inputs: str
     # Generation parameters
-    parameters: Optional[Parameters] = None
+    parameters: Optional[Parameters]
     # Whether to stream output tokens
     stream: bool = False
 
@@ -172,7 +139,7 @@ class InputToken(BaseModel):
     text: str
     # Logprob
     # Optional since the logprob of the first token cannot be computed
-    logprob: Optional[float] = None
+    logprob: Optional[float]
 
 
 # Generated tokens
@@ -182,7 +149,7 @@ class Token(BaseModel):
     # Token text
     text: str
     # Logprob
-    logprob: Optional[float] = None
+    logprob: float
     # Is the token a special token
     # Can be used to ignore tokens when concatenating
     special: bool
@@ -207,13 +174,11 @@ class BestOfSequence(BaseModel):
     # Number of generated tokens
     generated_tokens: int
     # Sampling seed if sampling was activated
-    seed: Optional[int] = None
+    seed: Optional[int]
     # Decoder input tokens, empty if decoder_input_details is False
     prefill: List[InputToken]
     # Generated tokens
     tokens: List[Token]
-    # Most likely tokens
-    top_tokens: Optional[List[List[Token]]] = None
 
 
 # `generate` details
@@ -223,15 +188,13 @@ class Details(BaseModel):
     # Number of generated tokens
     generated_tokens: int
     # Sampling seed if sampling was activated
-    seed: Optional[int] = None
+    seed: Optional[int]
     # Decoder input tokens, empty if decoder_input_details is False
     prefill: List[InputToken]
     # Generated tokens
     tokens: List[Token]
-    # Most likely tokens
-    top_tokens: Optional[List[List[Token]]] = None
     # Additional sequences when using the `best_of` parameter
-    best_of_sequences: Optional[List[BestOfSequence]] = None
+    best_of_sequences: Optional[List[BestOfSequence]]
 
 
 # `generate` return value
@@ -249,21 +212,19 @@ class StreamDetails(BaseModel):
     # Number of generated tokens
     generated_tokens: int
     # Sampling seed if sampling was activated
-    seed: Optional[int] = None
+    seed: Optional[int]
 
 
 # `generate_stream` return value
 class StreamResponse(BaseModel):
     # Generated token
     token: Token
-    # Most likely tokens
-    top_tokens: Optional[List[Token]] = None
     # Complete generated text
     # Only available when the generation is finished
-    generated_text: Optional[str] = None
+    generated_text: Optional[str]
     # Generation details
     # Only available when the generation is finished
-    details: Optional[StreamDetails] = None
+    details: Optional[StreamDetails]
 
 
 # Inference API currently deployed model

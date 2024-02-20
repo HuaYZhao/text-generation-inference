@@ -1,25 +1,23 @@
 /// Batching and inference logic
 use crate::validation::{Validation, ValidationError};
-use crate::{
-    ChatTemplateInputs, Entry, GenerateRequest, GenerateStreamResponse, HubTokenizerConfig,
-    Message, PrefillToken, Queue, Token,
-};
+use crate::{Entry, Queue, Token};
+use crate::{GenerateRequest, PrefillToken};
+use flume::r#async::RecvStream;
+use flume::SendTimeoutError;
 use futures::future::try_join_all;
-use minijinja::{Environment, ErrorKind, Template};
+use futures::stream::StreamExt;
 use nohash_hasher::IntMap;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
+use std::time::Duration;
 use text_generation_client::{
-    Batch, CachedBatch, ClientError, GeneratedText, Generation, ShardedClient, Tokens,
+    Batch, CachedBatch, ClientError, GeneratedText, Generation, PrefillTokens, ShardedClient,
 };
 use thiserror::Error;
-use tokio::sync::mpsc::error::SendError;
-use tokio::sync::{mpsc, Notify, Semaphore, TryAcquireError};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, TryAcquireError};
 use tokio::time::Instant;
-use tokio_stream::wrappers::UnboundedReceiverStream;
-use tokio_stream::StreamExt;
 use tracing::{info_span, instrument, Instrument, Span};
 
 /// Inference struct
@@ -31,8 +29,6 @@ pub struct Infer {
     queue: Queue,
     /// Shared state
     shared: Arc<Shared>,
-    /// Chat template
-    chat_template: Option<ChatTemplate>,
     /// Inference limit
     limit_concurrent_requests: Arc<Semaphore>,
 }
@@ -41,11 +37,6 @@ pub struct Infer {
 struct Shared {
     /// Batching background Tokio task notifier
     batching_task: Notify,
-}
-
-/// Raise a exception (custom function) used in the chat templates
-fn raise_exception(err_text: String) -> Result<String, minijinja::Error> {
-    Err(minijinja::Error::new(ErrorKind::SyntaxError, err_text))
 }
 
 impl Infer {
@@ -57,16 +48,12 @@ impl Infer {
         max_batch_prefill_tokens: u32,
         max_batch_total_tokens: u32,
         max_waiting_tokens: usize,
-        max_batch_size: Option<usize>,
         max_concurrent_requests: usize,
         requires_padding: bool,
-        window_size: Option<u32>,
-        speculate: u32,
         generation_health: Arc<AtomicBool>,
-        tokenizer_config: HubTokenizerConfig,
     ) -> Self {
         // Infer shared state
-        let queue = Queue::new(requires_padding, 16, window_size, speculate);
+        let queue = Queue::new(requires_padding, 16);
         let shared = Arc::new(Shared {
             batching_task: Notify::new(),
         });
@@ -78,15 +65,10 @@ impl Infer {
             max_batch_prefill_tokens,
             max_batch_total_tokens,
             max_waiting_tokens,
-            max_batch_size,
             queue.clone(),
             shared.clone(),
             generation_health,
         ));
-
-        let chat_template = tokenizer_config
-            .chat_template
-            .map(|t| ChatTemplate::new(t, tokenizer_config.bos_token, tokenizer_config.eos_token));
 
         // Inference limit with a semaphore
         let semaphore = Arc::new(Semaphore::new(max_concurrent_requests));
@@ -95,17 +77,22 @@ impl Infer {
             validation,
             queue,
             shared,
-            chat_template,
             limit_concurrent_requests: semaphore,
         }
     }
 
     /// Add a new request to the queue and return a stream of InferStreamResponse
-    #[instrument(skip_all)]
+    #[instrument(skip(self))]
     pub(crate) async fn generate_stream(
         &self,
         request: GenerateRequest,
-    ) -> Result<GenerateStreamResponse, InferError> {
+    ) -> Result<
+        (
+            OwnedSemaphorePermit,
+            RecvStream<Result<InferStreamResponse, InferError>>,
+        ),
+        InferError,
+    > {
         // Limit concurrent requests by acquiring a permit from the semaphore
         let permit = self
             .clone()
@@ -125,8 +112,7 @@ impl Infer {
         })?;
 
         // MPSC channel to communicate with the background batching task
-        let (response_tx, response_rx) = mpsc::unbounded_channel();
-        let input_length = valid_request.input_length;
+        let (response_tx, response_rx) = flume::unbounded();
 
         // Append the request to the queue
         self.queue.append(Entry {
@@ -143,64 +129,21 @@ impl Infer {
         self.shared.batching_task.notify_one();
 
         // Return stream
-        Ok((
-            permit,
-            input_length,
-            UnboundedReceiverStream::new(response_rx),
-        ))
-    }
-
-    /// Tokenizer the input
-    #[instrument(skip_all)]
-    pub(crate) async fn tokenize(
-        &self,
-        request: GenerateRequest,
-    ) -> Result<Option<tokenizers::Encoding>, InferError> {
-        // Tokenize request
-        let inputs = request.inputs;
-        let truncate = request.parameters.truncate;
-        let encoding = self
-            .validation
-            .tokenize(inputs, truncate)
-            .await
-            .map_err(|err| {
-                tracing::error!("Tokenization {err}");
-                err
-            })?;
-
-        // Return Encoding
-        Ok(encoding.map(|(encoding, _)| encoding))
-    }
-
-    /// Apply the chat template to the chat request
-    #[instrument(skip_all)]
-    pub(crate) fn apply_chat_template(&self, messages: Vec<Message>) -> Result<String, InferError> {
-        self.chat_template
-            .as_ref()
-            .ok_or_else(|| InferError::TemplateError(ErrorKind::TemplateNotFound.into()))?
-            .apply(messages)
-            .map_err(|e| {
-                metrics::increment_counter!("tgi_request_failure", "err" => "template");
-                tracing::error!("{e}");
-                e
-            })
+        Ok((permit, response_rx.into_stream()))
     }
 
     /// Add a new request to the queue and return a InferResponse
-    #[instrument(skip_all)]
+    #[instrument(skip(self))]
     pub(crate) async fn generate(
         &self,
         request: GenerateRequest,
     ) -> Result<InferResponse, InferError> {
-        let use_top_tokens = request.parameters.top_n_tokens.is_some_and(|x| x > 0);
-
         // Create stream and keep semaphore permit as long as generate lives
-        let (_permit, _input_length, mut stream) = self.generate_stream(request).await?;
+        let (_permit, mut stream) = self.generate_stream(request).await?;
 
         // Return values
         let mut result_prefill = Vec::new();
         let mut result_tokens = Vec::new();
-        let mut result_top_tokens = Vec::new();
         let mut result_generated_text = None;
         let mut result_start = None;
         let mut result_queued = None;
@@ -221,10 +164,7 @@ impl Infer {
                         .collect();
                 }
                 // Push last token
-                InferStreamResponse::Intermediate { token, top_tokens } => {
-                    result_tokens.push(token);
-                    result_top_tokens.push(top_tokens);
-                }
+                InferStreamResponse::Token(token) => result_tokens.push(token),
                 // Final message
                 // Set return values
                 InferStreamResponse::End {
@@ -232,10 +172,8 @@ impl Infer {
                     generated_text,
                     start,
                     queued,
-                    top_tokens,
                 } => {
                     result_tokens.push(token);
-                    result_top_tokens.push(top_tokens);
                     result_generated_text = Some(generated_text);
                     result_start = Some(start);
                     result_queued = Some(queued)
@@ -249,16 +187,10 @@ impl Infer {
         {
             Ok(InferResponse {
                 prefill: result_prefill,
-                _input_length,
                 tokens: result_tokens,
                 generated_text,
                 queued,
                 start,
-                top_tokens: if use_top_tokens {
-                    result_top_tokens
-                } else {
-                    Vec::new()
-                },
             })
         } else {
             let err = InferError::IncompleteGeneration;
@@ -269,7 +201,7 @@ impl Infer {
     }
     /// Add best_of new requests to the queue and return a InferResponse of the sequence with
     /// the highest log probability per token
-    #[instrument(skip(self, request))]
+    #[instrument(skip(self))]
     pub(crate) async fn generate_best_of(
         &self,
         request: GenerateRequest,
@@ -306,42 +238,6 @@ impl Infer {
     }
 }
 
-#[derive(Clone)]
-struct ChatTemplate {
-    template: Template<'static, 'static>,
-    bos_token: Option<String>,
-    eos_token: Option<String>,
-}
-
-impl ChatTemplate {
-    fn new(template: String, bos_token: Option<String>, eos_token: Option<String>) -> Self {
-        let mut env = Box::new(Environment::new());
-        let template_str = template.into_boxed_str();
-        env.add_function("raise_exception", raise_exception);
-        // leaking env and template_str as read-only, static resources for performance.
-        let template = Box::leak(env)
-            .template_from_str(Box::leak(template_str))
-            .unwrap();
-
-        Self {
-            template,
-            bos_token,
-            eos_token,
-        }
-    }
-
-    fn apply(&self, messages: Vec<Message>) -> Result<String, InferError> {
-        self.template
-            .render(ChatTemplateInputs {
-                messages,
-                bos_token: self.bos_token.as_deref(),
-                eos_token: self.eos_token.as_deref(),
-                add_generation_prompt: true,
-            })
-            .map_err(InferError::TemplateError)
-    }
-}
-
 /// Batching logic
 /// Will be launched in a background Tokio task
 ///
@@ -353,7 +249,6 @@ async fn batching_task(
     max_batch_prefill_tokens: u32,
     max_batch_total_tokens: u32,
     max_waiting_tokens: usize,
-    max_batch_size: Option<usize>,
     queue: Queue,
     shared: Arc<Shared>,
     generation_health: Arc<AtomicBool>,
@@ -367,12 +262,7 @@ async fn batching_task(
         // This batch might be smaller than the maximum batch size if there are not enough requests
         // waiting in the queue
         while let Some((mut entries, batch, span)) = queue
-            .next_batch(
-                None,
-                max_batch_size,
-                max_batch_prefill_tokens,
-                max_batch_total_tokens,
-            )
+            .next_batch(None, max_batch_prefill_tokens, max_batch_total_tokens)
             .await
         {
             let mut cached_batch = prefill(&mut client, batch, &mut entries, &generation_health)
@@ -400,11 +290,10 @@ async fn batching_task(
                 };
 
                 let token_budget = max_batch_total_tokens.saturating_sub(batch_max_tokens);
-                let max_size = max_batch_size.map(|max_size| max_size - batch_size as usize);
 
                 // Try to get a new batch
                 if let Some((mut new_entries, new_batch, span)) = queue
-                    .next_batch(min_size, max_size, max_batch_prefill_tokens, token_budget)
+                    .next_batch(min_size, max_batch_prefill_tokens, token_budget)
                     .await
                 {
                     // Tracking metrics
@@ -476,20 +365,15 @@ async fn prefill(
     metrics::increment_counter!("tgi_batch_inference_count", "method" => "prefill");
 
     match client.prefill(batch).await {
-        Ok((generations, next_batch, timings)) => {
+        Ok((generations, next_batch)) => {
             // Update health
             generation_health.store(true, Ordering::SeqCst);
-
-            let start_filtering_time = Instant::now();
             // Send generated tokens and filter stopped entries
             filter_send_generations(generations, entries);
 
             // Filter next batch and remove requests that were stopped
             let next_batch = filter_batch(client, next_batch, entries).await;
 
-            metrics::histogram!("tgi_batch_forward_duration", timings.forward.as_secs_f64(), "method" => "prefill");
-            metrics::histogram!("tgi_batch_decode_duration", timings.decode.as_secs_f64(), "method" => "prefill");
-            metrics::histogram!("tgi_batch_filter_duration", start_filtering_time.elapsed().as_secs_f64(), "method" => "prefill");
             metrics::histogram!("tgi_batch_inference_duration", start_time.elapsed().as_secs_f64(), "method" => "prefill");
             metrics::increment_counter!("tgi_batch_inference_success", "method" => "prefill");
             next_batch
@@ -518,23 +402,15 @@ async fn decode(
     metrics::increment_counter!("tgi_batch_inference_count", "method" => "decode");
 
     match client.decode(batches).await {
-        Ok((generations, next_batch, timings)) => {
+        Ok((generations, next_batch)) => {
             // Update health
             generation_health.store(true, Ordering::SeqCst);
-
-            let start_filtering_time = Instant::now();
             // Send generated tokens and filter stopped entries
             filter_send_generations(generations, entries);
 
             // Filter next batch and remove requests that were stopped
             let next_batch = filter_batch(client, next_batch, entries).await;
 
-            if let Some(concat_duration) = timings.concat {
-                metrics::histogram!("tgi_batch_concat_duration", concat_duration.as_secs_f64(), "method" => "decode");
-            }
-            metrics::histogram!("tgi_batch_forward_duration", timings.forward.as_secs_f64(), "method" => "decode");
-            metrics::histogram!("tgi_batch_decode_duration", timings.decode.as_secs_f64(), "method" => "decode");
-            metrics::histogram!("tgi_batch_filter_duration", start_filtering_time.elapsed().as_secs_f64(), "method" => "decode");
             metrics::histogram!("tgi_batch_inference_duration", start_time.elapsed().as_secs_f64(), "method" => "decode");
             metrics::increment_counter!("tgi_batch_inference_success", "method" => "decode");
             next_batch
@@ -603,7 +479,10 @@ fn filter_send_generations(generations: Vec<Generation>, entries: &mut IntMap<u6
         // If the receive an error from the Flume channel, it means that the client dropped the
         // request and we need to stop generating hence why we unwrap_or(true)
         let stopped = send_responses(generation, entry).map_err(|err| {
-            tracing::error!("Entry response channel error.");
+            if let SendTimeoutError::Timeout(_) = *err {
+                tracing::error!("Entry response channel timed out.")
+            }
+
             metrics::increment_counter!("tgi_request_failure", "err" => "dropped");
             err
         }).unwrap_or(true);
@@ -617,10 +496,9 @@ fn filter_send_generations(generations: Vec<Generation>, entries: &mut IntMap<u6
 fn send_responses(
     generation: Generation,
     entry: &Entry,
-) -> Result<bool, Box<SendError<Result<InferStreamResponse, InferError>>>> {
+) -> Result<bool, Box<SendTimeoutError<Result<InferStreamResponse, InferError>>>> {
     // Return directly if the channel is disconnected
-    if entry.response_tx.is_closed() {
-        metrics::increment_counter!("tgi_request_failure", "err" => "dropped");
+    if entry.response_tx.is_disconnected() {
         return Ok(true);
     }
 
@@ -628,69 +506,40 @@ fn send_responses(
 
     if let Some(prefill_tokens) = generation.prefill_tokens {
         // Send message
-        entry
-            .response_tx
-            .send(Ok(InferStreamResponse::Prefill(prefill_tokens)))?;
+        entry.response_tx.send_timeout(
+            Ok(InferStreamResponse::Prefill(prefill_tokens)),
+            Duration::from_millis(10),
+        )?;
     }
 
     // Create last Token
-    let tokens_ = generation.tokens.expect("Non empty tokens in generation");
-    let n = tokens_.ids.len();
-    metrics::histogram!("tgi_request_skipped_tokens", (n - 1) as f64);
-    let mut iterator = tokens_
-        .ids
-        .into_iter()
-        .zip(tokens_.logprobs)
-        .zip(tokens_.texts)
-        .zip(tokens_.is_special)
-        .enumerate()
-        .peekable();
-    while let Some((i, (((id, logprob), text), special))) = iterator.next() {
-        let token = Token {
-            id,
-            text,
-            logprob,
-            special,
-        };
-        let top_tokens = if let Some(top_tokens_) = generation.top_tokens.get(i) {
-            top_tokens_
-                .ids
-                .iter()
-                .zip(top_tokens_.logprobs.iter())
-                .zip(top_tokens_.texts.iter())
-                .zip(top_tokens_.is_special.iter())
-                .map(|(((&id, &logprob), text), &special)| Token {
-                    id,
-                    text: text.to_string(),
-                    logprob,
-                    special,
-                })
-                .collect()
-        } else {
-            vec![]
-        };
-        match (&generation.generated_text, iterator.peek()) {
-            (Some(generated_text), None) => {
-                // Generation has ended
-                stopped = true;
-                // Send message
-                entry.response_tx.send(Ok(InferStreamResponse::End {
-                    token,
-                    top_tokens,
-                    generated_text: generated_text.clone(),
-                    queued: entry.queue_time,
-                    start: entry.batch_time.unwrap(),
-                }))?;
-            }
-            _ => {
-                // Send message
-                entry
-                    .response_tx
-                    .send(Ok(InferStreamResponse::Intermediate { token, top_tokens }))?;
-            }
-        }
-    }
+    let token = Token {
+        id: generation.token_id,
+        text: generation.token_text,
+        logprob: generation.token_logprob,
+        special: generation.token_is_special,
+    };
 
+    if let Some(generated_text) = generation.generated_text {
+        // Generation has ended
+        stopped = true;
+        // Send message
+        entry.response_tx.send_timeout(
+            Ok(InferStreamResponse::End {
+                token,
+                generated_text,
+                queued: entry.queue_time,
+                start: entry.batch_time.unwrap(),
+            }),
+            Duration::from_millis(10),
+        )?;
+    } else {
+        // Send message
+        entry.response_tx.send_timeout(
+            Ok(InferStreamResponse::Token(token)),
+            Duration::from_millis(10),
+        )?;
+    }
     Ok(stopped)
 }
 
@@ -707,7 +556,7 @@ fn send_errors(error: ClientError, entries: &mut IntMap<u64, Entry>) {
         // unwrap_or is valid here as we don't care if the receiver is gone.
         entry
             .response_tx
-            .send(Err(err))
+            .send_timeout(Err(err), Duration::from_millis(10))
             .unwrap_or(());
     });
 }
@@ -715,16 +564,12 @@ fn send_errors(error: ClientError, entries: &mut IntMap<u64, Entry>) {
 #[derive(Debug)]
 pub(crate) enum InferStreamResponse {
     // Optional first message
-    Prefill(Tokens),
+    Prefill(PrefillTokens),
     // Intermediate messages
-    Intermediate {
-        token: Token,
-        top_tokens: Vec<Token>,
-    },
+    Token(Token),
     // Last message
     End {
         token: Token,
-        top_tokens: Vec<Token>,
         generated_text: GeneratedText,
         start: Instant,
         queued: Instant,
@@ -733,16 +578,11 @@ pub(crate) enum InferStreamResponse {
 
 #[derive(Debug)]
 pub(crate) struct InferResponse {
-    /// input_length is the input as perceived by the rust tokenizer in the
-    /// validation pathway. It is redundant with prefill.len() but prefill
-    /// has data only if the user asked for it. This will always be filled.
-    pub(crate) _input_length: u32,
     pub(crate) prefill: Vec<PrefillToken>,
     pub(crate) tokens: Vec<Token>,
     pub(crate) generated_text: GeneratedText,
     pub(crate) queued: Instant,
     pub(crate) start: Instant,
-    pub(crate) top_tokens: Vec<Vec<Token>>,
 }
 
 #[derive(Debug, Error)]
@@ -755,8 +595,6 @@ pub enum InferError {
     ValidationError(#[from] ValidationError),
     #[error("Incomplete generation")]
     IncompleteGeneration,
-    #[error("Template error: {0}")]
-    TemplateError(#[from] minijinja::Error),
 }
 
 impl InferError {
@@ -766,271 +604,6 @@ impl InferError {
             InferError::Overloaded(_) => "overloaded",
             InferError::ValidationError(_) => "validation",
             InferError::IncompleteGeneration => "incomplete_generation",
-            InferError::TemplateError(_) => "template_error",
         }
-    }
-}
-
-// tests
-#[cfg(test)]
-mod tests {
-    use crate::infer::raise_exception;
-    use crate::ChatTemplateInputs;
-    use crate::Message;
-    use minijinja::Environment;
-
-    #[test]
-    fn test_chat_template() {
-        let env = Environment::new();
-
-        let source = r#"
-        {% for message in messages %}
-            {% if message['role'] == 'system' %}
-                {% if message['content']%}
-                    {{'### System:\n' + message['content']+'\n\n'}}
-                {% endif %}
-            {% elif message['role'] == 'user' %}
-                {{'### User:\n' + message['content']+'\n\n'}}
-            {% elif message['role'] == 'assistant' %}
-                {{'### Assistant:\n'  + message['content']}}
-            {% endif %}
-            {% if loop.last and add_generation_prompt %}
-                {{ '### Assistant:\n' }}
-            {% endif %}
-        {% endfor %}"#;
-
-        // trim all the whitespace
-        let source = source
-            .lines()
-            .map(|line| line.trim())
-            .collect::<Vec<&str>>()
-            .join("");
-
-        let tmpl = env.template_from_str(&source);
-
-        let chat_template_inputs = ChatTemplateInputs {
-            messages: vec![
-                Message {
-                    role: "user".to_string(),
-                    content: "Hi!".to_string(),
-                    name: None,
-                },
-                Message {
-                    role: "assistant".to_string(),
-                    content: "Hello how can I help?".to_string(),
-                    name: None,
-                },
-                Message {
-                    role: "user".to_string(),
-                    content: "What is Deep Learning?".to_string(),
-                    name: None,
-                },
-                Message {
-                    role: "assistant".to_string(),
-                    content: "magic!".to_string(),
-                    name: None,
-                },
-            ],
-            bos_token: Some("[BOS]"),
-            eos_token: Some("[EOS]"),
-            add_generation_prompt: true,
-        };
-
-        let result = tmpl.unwrap().render(chat_template_inputs).unwrap();
-
-        assert_eq!(
-            result,
-            "### User:\nHi!\n\n### Assistant:\nHello how can I help?### User:\nWhat is Deep Learning?\n\n### Assistant:\nmagic!### Assistant:\n"
-        );
-    }
-
-    #[test]
-    fn test_chat_template_invalid_with_raise() {
-        let mut env = Environment::new();
-        env.add_function("raise_exception", raise_exception);
-
-        let source = r#"
-        {{ bos_token }}
-        {% for message in messages %}
-        {% if (message['role'] == 'user') != (loop.index0 % 2 == 0) %}
-        {{ raise_exception('Conversation roles must alternate user/assistant/user/assistant/...') }}
-        {% endif %}
-        {% if message['role'] == 'user' %}
-        {{ '[INST] ' + message['content'] + ' [/INST]' }}
-        {% elif message['role'] == 'assistant' %}
-        {{ message['content'] + eos_token}}
-        {% else %}
-        {{ raise_exception('Only user and assistant roles are supported!') }}
-        {% endif %}
-        {% endfor %}"#;
-
-        // trim all the whitespace
-        let source = source
-            .lines()
-            .map(|line| line.trim())
-            .collect::<Vec<&str>>()
-            .join("");
-
-        let tmpl = env.template_from_str(&source);
-
-        let chat_template_inputs = ChatTemplateInputs {
-            messages: vec![
-                Message {
-                    role: "user".to_string(),
-                    content: "Hi!".to_string(),
-                    name: None,
-                },
-                Message {
-                    role: "user".to_string(),
-                    content: "Hi again!".to_string(),
-                    name: None,
-                },
-                Message {
-                    role: "assistant".to_string(),
-                    content: "Hello how can I help?".to_string(),
-                    name: None,
-                },
-                Message {
-                    role: "user".to_string(),
-                    content: "What is Deep Learning?".to_string(),
-                    name: None,
-                },
-                Message {
-                    role: "assistant".to_string(),
-                    content: "magic!".to_string(),
-                    name: None,
-                },
-            ],
-            bos_token: Some("[BOS]"),
-            eos_token: Some("[EOS]"),
-            add_generation_prompt: true,
-        };
-
-        let result = tmpl.unwrap().render(chat_template_inputs); //.err().unwrap();
-
-        match result {
-            Ok(_) => panic!("Should have failed"),
-            Err(e) => {
-                assert_eq!(
-                    e.detail().unwrap(),
-                    "Conversation roles must alternate user/assistant/user/assistant/..."
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn test_chat_template_valid_with_raise() {
-        let mut env = Environment::new();
-        env.add_function("raise_exception", raise_exception);
-
-        let source = r#"
-        {{ bos_token }}
-        {% for message in messages %}
-        {% if (message['role'] == 'user') != (loop.index0 % 2 == 0) %}
-        {{ raise_exception('Conversation roles must alternate user/assistant/user/assistant/...') }}
-        {% endif %}
-        {% if message['role'] == 'user' %}
-        {{ '[INST] ' + message['content'] + ' [/INST]' }}
-        {% elif message['role'] == 'assistant' %}
-        {{ message['content'] + eos_token}}
-        {% else %}
-        {{ raise_exception('Only user and assistant roles are supported!') }}
-        {% endif %}
-        {% endfor %}"#;
-
-        // trim all the whitespace
-        let source = source
-            .lines()
-            .map(|line| line.trim())
-            .collect::<Vec<&str>>()
-            .join("");
-
-        let tmpl = env.template_from_str(&source);
-
-        let chat_template_inputs = ChatTemplateInputs {
-            messages: vec![
-                Message {
-                    role: "user".to_string(),
-                    content: "Hi!".to_string(),
-                    name: None,
-                },
-                Message {
-                    role: "assistant".to_string(),
-                    content: "Hello how can I help?".to_string(),
-                    name: None,
-                },
-                Message {
-                    role: "user".to_string(),
-                    content: "What is Deep Learning?".to_string(),
-                    name: None,
-                },
-                Message {
-                    role: "assistant".to_string(),
-                    content: "magic!".to_string(),
-                    name: None,
-                },
-            ],
-            bos_token: Some("[BOS]"),
-            eos_token: Some("[EOS]"),
-            add_generation_prompt: true,
-        };
-
-        let result = tmpl.unwrap().render(chat_template_inputs).unwrap();
-        assert_eq!(result, "[BOS][INST] Hi! [/INST]Hello how can I help?[EOS][INST] What is Deep Learning? [/INST]magic![EOS]");
-    }
-
-    #[test]
-    fn test_chat_template_valid_with_add_generation_prompt() {
-        let mut env = Environment::new();
-        env.add_function("raise_exception", raise_exception);
-
-        let source = r#"
-        {% for message in messages %}
-        {{'<|im_start|>' + message['role'] + '\n' + message['content'] + '<|im_end|>' + '\n'}}
-        {% endfor %}
-        {% if add_generation_prompt %}
-            {{ '<|im_start|>assistant\n' }}
-        {% endif %}"#;
-
-        // trim all the whitespace
-        let source = source
-            .lines()
-            .map(|line| line.trim())
-            .collect::<Vec<&str>>()
-            .join("");
-
-        let tmpl = env.template_from_str(&source);
-
-        let chat_template_inputs = ChatTemplateInputs {
-            messages: vec![
-                Message {
-                    role: "user".to_string(),
-                    content: "Hi!".to_string(),
-                    name: None,
-                },
-                Message {
-                    role: "assistant".to_string(),
-                    content: "Hello how can I help?".to_string(),
-                    name: None,
-                },
-                Message {
-                    role: "user".to_string(),
-                    content: "What is Deep Learning?".to_string(),
-                    name: None,
-                },
-                Message {
-                    role: "assistant".to_string(),
-                    content: "magic!".to_string(),
-                    name: None,
-                },
-            ],
-            bos_token: Some("[BOS]"),
-            eos_token: Some("[EOS]"),
-            add_generation_prompt: true,
-        };
-
-        let result = tmpl.unwrap().render(chat_template_inputs).unwrap();
-        assert_eq!(result, "<|im_start|>user\nHi!<|im_end|>\n<|im_start|>assistant\nHello how can I help?<|im_end|>\n<|im_start|>user\nWhat is Deep Learning?<|im_end|>\n<|im_start|>assistant\nmagic!<|im_end|>\n<|im_start|>assistant\n");
     }
 }

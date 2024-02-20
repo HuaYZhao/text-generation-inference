@@ -49,10 +49,7 @@ from text_generation_server.utils.layers import (
 
 
 CUSTOM_KERNELS_ENABLED = False
-if (
-    torch.cuda.is_available()
-    and not os.environ.get("DISABLE_CUSTOM_KERNELS", "False") == "True"
-):
+if not os.environ.get("DISABLE_CUSTOM_KERNELS", "False") == "True":
     try:
         from custom_kernels import fused_attention_cuda
 
@@ -283,10 +280,10 @@ class GPTNeoXAttention(nn.Module):
         batch_size, num_attention_heads, query_length, attn_head_size = query.size()
         key_length = key.size(-2)
 
-        query = query.reshape(
+        query = query.view(
             batch_size * num_attention_heads, query_length, attn_head_size
         )
-        key = key.reshape(batch_size * num_attention_heads, key_length, attn_head_size)
+        key = key.view(batch_size * num_attention_heads, key_length, attn_head_size)
         attn_scores = torch.zeros(
             1,
             dtype=query.dtype,

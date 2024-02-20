@@ -6,7 +6,6 @@ from pathlib import Path
 from loguru import logger
 from typing import Optional
 from enum import Enum
-from huggingface_hub import hf_hub_download
 
 
 app = typer.Typer()
@@ -14,11 +13,7 @@ app = typer.Typer()
 
 class Quantization(str, Enum):
     bitsandbytes = "bitsandbytes"
-    bitsandbytes_nf4 = "bitsandbytes-nf4"
-    bitsandbytes_fp4 = "bitsandbytes-fp4"
     gptq = "gptq"
-    awq = "awq"
-    eetq = "eetq"
 
 
 class Dtype(str, Enum):
@@ -32,7 +27,6 @@ def serve(
     revision: Optional[str] = None,
     sharded: bool = False,
     quantize: Optional[Quantization] = None,
-    speculate: Optional[int] = None,
     dtype: Optional[Dtype] = None,
     trust_remote_code: bool = False,
     uds_path: Path = "/tmp/text-generation-server",
@@ -77,24 +71,12 @@ def serve(
     # Downgrade enum into str for easier management later on
     quantize = None if quantize is None else quantize.value
     dtype = None if dtype is None else dtype.value
-    if dtype is not None and quantize not in {
-        None,
-        "bitsandbytes",
-        "bitsandbytes-nf4",
-        "bitsandbytes-fp4",
-    }:
+    if dtype is not None and quantize is not None:
         raise RuntimeError(
             "Only 1 can be set between `dtype` and `quantize`, as they both decide how goes the final model."
         )
     server.serve(
-        model_id,
-        revision,
-        sharded,
-        quantize,
-        speculate,
-        dtype,
-        trust_remote_code,
-        uds_path,
+        model_id, revision, sharded, quantize, dtype, trust_remote_code, uds_path
     )
 
 
@@ -106,7 +88,6 @@ def download_weights(
     auto_convert: bool = True,
     logger_level: str = "INFO",
     json_output: bool = False,
-    trust_remote_code: bool = False,
 ):
     # Remove default handler
     logger.remove()
@@ -129,7 +110,7 @@ def download_weights(
         logger.info("Files are already present on the host. " "Skipping download.")
         return
     # Local files not found
-    except (utils.LocalEntryNotFoundError, FileNotFoundError, utils.EntryNotFoundError):
+    except (utils.LocalEntryNotFoundError, FileNotFoundError):
         pass
 
     is_local_model = (Path(model_id).exists() and Path(model_id).is_dir()) or os.getenv(
@@ -137,54 +118,6 @@ def download_weights(
     ) is not None
 
     if not is_local_model:
-        try:
-            adapter_config_filename = hf_hub_download(
-                model_id, revision=revision, filename="adapter_config.json"
-            )
-            utils.download_and_unload_peft(
-                model_id, revision, trust_remote_code=trust_remote_code
-            )
-            is_local_model = True
-            utils.weight_files(model_id, revision, extension)
-            return
-        except (utils.LocalEntryNotFoundError, utils.EntryNotFoundError):
-            pass
-
-        try:
-            import json
-
-            medusa_head = hf_hub_download(
-                model_id, revision=revision, filename="medusa_lm_head.pt"
-            )
-            if auto_convert:
-                medusa_sf = Path(medusa_head[: -len(".pt")] + ".safetensors")
-                if not medusa_sf.exists():
-                    utils.convert_files([Path(medusa_head)], [medusa_sf], [])
-            medusa_config = hf_hub_download(
-                model_id, revision=revision, filename="config.json"
-            )
-            with open(medusa_config, "r") as f:
-                config = json.load(f)
-
-            model_id = config["base_model_name_or_path"]
-            revision = "main"
-            try:
-                utils.weight_files(model_id, revision, extension)
-                logger.info(
-                    f"Files for parent {model_id} are already present on the host. "
-                    "Skipping download."
-                )
-                return
-            # Local files not found
-            except (
-                utils.LocalEntryNotFoundError,
-                FileNotFoundError,
-                utils.EntryNotFoundError,
-            ):
-                pass
-        except (utils.LocalEntryNotFoundError, utils.EntryNotFoundError):
-            pass
-
         # Try to download weights from the hub
         try:
             filenames = utils.weight_hub_files(model_id, revision, extension)
@@ -197,46 +130,6 @@ def download_weights(
             # Check if we want to automatically convert to safetensors or if we can use .bin weights instead
             if not extension == ".safetensors" or not auto_convert:
                 raise e
-
-    elif (Path(model_id) / "medusa_lm_head.pt").exists():
-        # Try to load as a local Medusa model
-        try:
-            import json
-
-            medusa_head = Path(model_id) / "medusa_lm_head.pt"
-            if auto_convert:
-                medusa_sf = Path(model_id) / "medusa_lm_head.safetensors"
-                if not medusa_sf.exists():
-                    utils.convert_files([Path(medusa_head)], [medusa_sf], [])
-            medusa_config = Path(model_id) / "config.json"
-            with open(medusa_config, "r") as f:
-                config = json.load(f)
-
-            model_id = config["base_model_name_or_path"]
-            revision = "main"
-            try:
-                utils.weight_files(model_id, revision, extension)
-                logger.info(
-                    f"Files for parent {model_id} are already present on the host. "
-                    "Skipping download."
-                )
-                return
-            # Local files not found
-            except (utils.LocalEntryNotFoundError, utils.EntryNotFoundError):
-                pass
-        except (utils.LocalEntryNotFoundError, utils.EntryNotFoundError):
-            pass
-
-    elif (Path(model_id) / "adapter_config.json").exists():
-        # Try to load as a local PEFT model
-        try:
-            utils.download_and_unload_peft(
-                model_id, revision, trust_remote_code=trust_remote_code
-            )
-            utils.weight_files(model_id, revision, extension)
-            return
-        except (utils.LocalEntryNotFoundError, utils.EntryNotFoundError):
-            pass
 
     # Try to see if there are local pytorch weights
     try:
@@ -268,23 +161,20 @@ def download_weights(
             for p in local_pt_files
         ]
         try:
+            from transformers import AutoConfig
             import transformers
-            import json
 
-            if is_local_model:
-                config_filename = os.path.join(model_id, "config.json")
-            else:
-                config_filename = hf_hub_download(
-                    model_id, revision=revision, filename="config.json"
-                )
-            with open(config_filename, "r") as f:
-                config = json.load(f)
-            architecture = config["architectures"][0]
+            config = AutoConfig.from_pretrained(
+                model_id,
+                revision=revision,
+            )
+            architecture = config.architectures[0]
 
             class_ = getattr(transformers, architecture)
 
             # Name for this varible depends on transformers version.
             discard_names = getattr(class_, "_tied_weights_keys", [])
+            discard_names.extend(getattr(class_, "_keys_to_ignore_on_load_missing", []))
 
         except Exception as e:
             discard_names = []

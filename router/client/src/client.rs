@@ -1,10 +1,9 @@
 /// Single shard Client
-use crate::pb::generate::v2::text_generation_service_client::TextGenerationServiceClient;
-use crate::pb::generate::v2::*;
+use crate::pb::generate::v1::text_generation_service_client::TextGenerationServiceClient;
+use crate::pb::generate::v1::*;
 use crate::Result;
 use grpc_metadata::InjectTelemetryContext;
 use std::cmp::min;
-use std::time::Duration;
 use tonic::transport::{Channel, Uri};
 use tracing::instrument;
 
@@ -104,19 +103,17 @@ impl Client {
         &mut self,
         max_input_length: u32,
         max_prefill_tokens: u32,
-        max_total_tokens: u32,
-        max_batch_size: Option<usize>,
     ) -> Result<Option<u32>> {
         let mut n_tokens = 0;
         let mut requests = Vec::new();
+
         // Create requests
         while n_tokens < max_prefill_tokens {
-            let truncate = min(max_input_length, max_prefill_tokens - n_tokens);
             requests.push(Request {
                 id: 0,
                 // We truncate the input on the server side to be sure that it has the correct size
                 inputs: "_test ".to_string().repeat(max_input_length as usize),
-                truncate,
+                truncate: min(max_input_length, max_prefill_tokens - n_tokens),
                 // Set sampling parameters to also take these ops into account in the max memory
                 parameters: Some(NextTokenChooserParameters {
                     temperature: 0.9,
@@ -126,25 +123,16 @@ impl Client {
                     do_sample: false,
                     seed: 0,
                     repetition_penalty: 1.2,
-                    frequency_penalty: 0.1,
                     watermark: true,
-                    grammar: String::new(),
-                    grammar_type: GrammarType::None as i32,
                 }),
                 stopping_parameters: Some(StoppingCriteriaParameters {
-                    max_new_tokens: max_total_tokens - truncate,
+                    max_new_tokens: 2,
                     stop_sequences: vec![],
-                    ignore_eos_token: true,
+                    ignore_eos_token: false,
                 }),
                 prefill_logprobs: true,
-                top_n_tokens: 20,
             });
             n_tokens += max_input_length;
-
-            // Check max_batch_size
-            if Some(requests.len()) == max_batch_size {
-                break;
-            }
         }
 
         let batch = Batch {
@@ -154,13 +142,7 @@ impl Client {
             max_tokens: 0,
         };
 
-        let request = tonic::Request::new(WarmupRequest {
-            batch: Some(batch),
-            max_input_length,
-            max_prefill_tokens,
-            max_total_tokens,
-        })
-        .inject_context();
+        let request = tonic::Request::new(WarmupRequest { batch: Some(batch) }).inject_context();
         let response = self.stub.warmup(request).await?.into_inner();
         Ok(response.max_supported_total_tokens)
     }
@@ -173,14 +155,10 @@ impl Client {
     pub async fn prefill(
         &mut self,
         batch: Batch,
-    ) -> Result<(Vec<Generation>, Option<CachedBatch>, PrefillTimings)> {
+    ) -> Result<(Vec<Generation>, Option<CachedBatch>)> {
         let request = tonic::Request::new(PrefillRequest { batch: Some(batch) }).inject_context();
         let response = self.stub.prefill(request).await?.into_inner();
-        Ok((
-            response.generations,
-            response.batch,
-            PrefillTimings::new(response.forward_ns, response.decode_ns, response.total_ns),
-        ))
+        Ok((response.generations, response.batch))
     }
 
     /// Generate one token for each request in the given cached batches
@@ -191,52 +169,9 @@ impl Client {
     pub async fn decode(
         &mut self,
         batches: Vec<CachedBatch>,
-    ) -> Result<(Vec<Generation>, Option<CachedBatch>, DecodeTimings)> {
+    ) -> Result<(Vec<Generation>, Option<CachedBatch>)> {
         let request = tonic::Request::new(DecodeRequest { batches }).inject_context();
         let response = self.stub.decode(request).await?.into_inner();
-        Ok((
-            response.generations,
-            response.batch,
-            DecodeTimings::new(
-                response.concat_ns,
-                response.forward_ns,
-                response.decode_ns,
-                response.total_ns,
-            ),
-        ))
-    }
-}
-
-pub struct PrefillTimings {
-    pub forward: Duration,
-    pub decode: Duration,
-    pub total: Duration,
-}
-
-impl PrefillTimings {
-    fn new(forward_ns: u64, decode_ns: u64, total_ns: u64) -> Self {
-        Self {
-            forward: Duration::from_nanos(forward_ns),
-            decode: Duration::from_nanos(decode_ns),
-            total: Duration::from_nanos(total_ns),
-        }
-    }
-}
-
-pub struct DecodeTimings {
-    pub concat: Option<Duration>,
-    pub forward: Duration,
-    pub decode: Duration,
-    pub total: Duration,
-}
-
-impl DecodeTimings {
-    fn new(concat_ns: Option<u64>, forward_ns: u64, decode_ns: u64, total_ns: u64) -> Self {
-        Self {
-            concat: concat_ns.map(Duration::from_nanos),
-            forward: Duration::from_nanos(forward_ns),
-            decode: Duration::from_nanos(decode_ns),
-            total: Duration::from_nanos(total_ns),
-        }
+        Ok((response.generations, response.batch))
     }
 }

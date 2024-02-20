@@ -16,7 +16,7 @@
       },
       {
         "id": 2009,
-        "logprob": -11.546875,
+        "logprob": -11.5546875,
         "text": "request"
       }
     ],
@@ -24,19 +24,19 @@
     "tokens": [
       {
         "id": 5229,
-        "logprob": -2.5839844,
+        "logprob": -2.5683594,
         "special": false,
         "text": " failed"
       },
       {
         "id": 29901,
-        "logprob": -0.44970703,
+        "logprob": -0.45336914,
         "special": false,
         "text": ":"
       },
       {
         "id": 4829,
-        "logprob": -1.8339844,
+        "logprob": -1.8408203,
         "special": false,
         "text": " Error"
       },
@@ -52,8 +52,7 @@
         "special": false,
         "text": " test"
       }
-    ],
-    "top_tokens": null
+    ]
   },
-  "generated_text": "Test request failed: Error in test"
+  "generated_text": "Test requestfailed: Error in test"
 }

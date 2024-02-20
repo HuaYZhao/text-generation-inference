@@ -5,8 +5,7 @@ from abc import ABC, abstractmethod
 from typing import List, Tuple, Optional, TypeVar, Type
 from transformers import PreTrainedTokenizerBase, PretrainedConfig
 
-from text_generation_server.models.types import Batch, Generation
-from text_generation_server.utils.speculate import get_speculate
+from text_generation_server.models.types import Batch, GeneratedText
 from text_generation_server.pb.generate_pb2 import InfoResponse
 
 B = TypeVar("B", bound=Batch)
@@ -22,8 +21,6 @@ class Model(ABC):
         device: torch.device,
         rank: int = 0,
         world_size: int = 1,
-        sliding_window: Optional[int] = None,
-        speculate: Optional[int] = None,
     ):
         self.model = model.eval()
         self.tokenizer = tokenizer
@@ -33,11 +30,6 @@ class Model(ABC):
         self.device = device
         self.rank = rank
         self.world_size = world_size
-        self.sliding_window = sliding_window if sliding_window != -1 else None
-
-        if speculate is None:
-            speculate = get_speculate()
-        self.speculate = speculate
 
         self.has_position_ids = (
             inspect.signature(model.forward).parameters.get("position_ids", None)
@@ -48,15 +40,10 @@ class Model(ABC):
 
     @property
     def info(self) -> InfoResponse:
-        if self.requires_padding and self.sliding_window is not None:
-            raise NotImplementedError("sliding_window is not implemented with padding")
-
         return InfoResponse(
             requires_padding=self.requires_padding,
             dtype=str(self.dtype),
             device_type=self.device.type,
-            window_size=self.sliding_window,
-            speculate=self.speculate,
         )
 
     @property
@@ -65,9 +52,7 @@ class Model(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def generate_token(
-        self, batch: B
-    ) -> Tuple[List[Generation], Optional[B], Tuple[int, int]]:
+    def generate_token(self, batch: B) -> Tuple[List[GeneratedText], Optional[B]]:
         raise NotImplementedError
 
     def warmup(self, batch: B) -> Optional[int]:
@@ -79,18 +64,16 @@ class Model(ABC):
         all_input_ids: List[int],
         prefix_offset: int = 0,
         read_offset: int = 0,
-        skip_special_tokens: bool = False,
     ) -> Tuple[str, int, int]:
         """Hack to hopefully support generate_stream for the maximum number of tokenizers"""
 
         # The prefix text is necessary only to defeat cleanup algorithms in the decode
         # which decide to add a space or not depending on the surrounding ids.
         prefix_text = self.tokenizer.decode(
-            all_input_ids[prefix_offset:read_offset],
-            skip_special_tokens=skip_special_tokens,
+            all_input_ids[prefix_offset:read_offset], skip_special_tokens=False
         )
         new_text = self.tokenizer.decode(
-            all_input_ids[prefix_offset:], skip_special_tokens=skip_special_tokens
+            all_input_ids[prefix_offset:], skip_special_tokens=False
         )
 
         if len(new_text) > len(prefix_text) and not new_text.endswith("�"):

@@ -6,7 +6,7 @@ use tokio::sync::mpsc;
 use tui::backend::Backend;
 use tui::layout::{Alignment, Constraint, Direction, Layout};
 use tui::style::{Color, Modifier, Style};
-use tui::text::{Line, Span};
+use tui::text::{Span, Spans};
 use tui::widgets::{
     Axis, BarChart, Block, Borders, Chart, Dataset, Gauge, GraphType, Paragraph, Tabs,
 };
@@ -244,7 +244,7 @@ impl App {
             .batch_size
             .iter()
             .map(|b| {
-                Line::from(vec![Span::styled(
+                Spans::from(vec![Span::styled(
                     format!("Batch: {b}"),
                     Style::default().fg(Color::White),
                 )])
@@ -466,9 +466,9 @@ fn latency_paragraph<'a>(latency: &mut Vec<f64>, name: &'static str) -> Paragrap
     let latency_percentiles = crate::utils::percentiles(latency, &[50, 90, 99]);
 
     // Latency p50/p90/p99 texts
-    let colors = [Color::LightGreen, Color::LightYellow, Color::LightRed];
+    let colors = vec![Color::LightGreen, Color::LightYellow, Color::LightRed];
     for (i, (name, value)) in latency_percentiles.iter().enumerate() {
-        let span = Line::from(vec![Span::styled(
+        let span = Spans::from(vec![Span::styled(
             format!("{name}:     {value:.2} ms"),
             Style::default().fg(colors[i]),
         )]);
@@ -483,16 +483,16 @@ fn latency_paragraph<'a>(latency: &mut Vec<f64>, name: &'static str) -> Paragrap
 }
 
 /// Average/High/Low spans
-fn statis_spans<'a>(data: &Vec<f64>, unit: &'static str) -> Vec<Line<'a>> {
+fn statis_spans<'a>(data: &Vec<f64>, unit: &'static str) -> Vec<Spans<'a>> {
     vec![
-        Line::from(vec![Span::styled(
+        Spans::from(vec![Span::styled(
             format!(
                 "Average: {:.2} {unit}",
                 data.iter().sum::<f64>() / data.len() as f64
             ),
             Style::default().fg(Color::LightBlue),
         )]),
-        Line::from(vec![Span::styled(
+        Spans::from(vec![Span::styled(
             format!(
                 "Lowest:  {:.2} {unit}",
                 data.iter()
@@ -501,7 +501,7 @@ fn statis_spans<'a>(data: &Vec<f64>, unit: &'static str) -> Vec<Line<'a>> {
             ),
             Style::default().fg(Color::Reset),
         )]),
-        Line::from(vec![Span::styled(
+        Spans::from(vec![Span::styled(
             format!(
                 "Highest: {:.2} {unit}",
                 data.iter()

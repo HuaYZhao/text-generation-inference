@@ -80,7 +80,6 @@ class GalacticaCausalLMBatch(CausalLMBatch):
         next_token_choosers = []
         stopping_criterias = []
         prefix_offsets = []
-        top_n_tokens = []
         read_offsets = []
         requests_idx_mapping = {}
 
@@ -92,14 +91,11 @@ class GalacticaCausalLMBatch(CausalLMBatch):
             requests_idx_mapping[r.id] = i
             # Add escape_custom_split_sequence to the CausalLMBatch logic
             inputs.append(escape_custom_split_sequence(r.inputs))
-            next_token_choosers.append(
-                NextTokenChooser.from_pb(r.parameters, device, tokenizer)
-            )
+            next_token_choosers.append(NextTokenChooser.from_pb(r.parameters, device))
             stopping_criteria = StoppingCriteria.from_pb(
                 r.stopping_parameters, tokenizer
             )
             stopping_criterias.append(stopping_criteria)
-            top_n_tokens.append(r.top_n_tokens)
             max_truncation = max(max_truncation, r.truncate)
             max_decode_tokens += stopping_criteria.max_new_tokens
             padding_right_offset = max(
@@ -133,9 +129,6 @@ class GalacticaCausalLMBatch(CausalLMBatch):
         position_ids = tokenized_inputs["attention_mask"].long().cumsum(-1) - 1
         position_ids.masked_fill_(tokenized_inputs["attention_mask"] == 0, 1)
         all_input_ids = tokenized_inputs["input_ids"].T.split(1, dim=1)
-        top_n_tokens_tensor = torch.tensor(
-            top_n_tokens, device=device, dtype=torch.int64
-        )
 
         max_tokens = len(inputs) * max_input_length + max_decode_tokens
 
@@ -153,8 +146,6 @@ class GalacticaCausalLMBatch(CausalLMBatch):
             read_offsets=read_offsets,
             next_token_choosers=next_token_choosers,
             stopping_criterias=stopping_criterias,
-            top_n_tokens=top_n_tokens,
-            top_n_tokens_tensor=top_n_tokens_tensor,
             max_input_length=max_input_length.item(),
             padding_right_offset=padding_right_offset,
             max_tokens=max_tokens,
@@ -176,7 +167,7 @@ class GalacticaSharded(CausalLM):
             dtype = torch.float16 if dtype is None else dtype
         else:
             device = torch.device("cpu")
-            dtype = torch.float32 if dtype is None else dtype
+            dtype = torch.float32
 
         tokenizer = AutoTokenizer.from_pretrained(
             model_id,
@@ -201,7 +192,7 @@ class GalacticaSharded(CausalLM):
             filenames, device=device, dtype=dtype, process_group=self.process_group
         )
         if config.quantize == "gptq":
-            weights._set_gptq_params(model_id, revision)
+            weights._set_gptq_params(model_id)
 
         model = OPTForCausalLM(config, weights)
 

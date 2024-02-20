@@ -1,7 +1,6 @@
 import asyncio
 import os
 import torch
-import time
 
 from grpc import aio
 from loguru import logger
@@ -15,20 +14,12 @@ from text_generation_server.interceptor import ExceptionInterceptor
 from text_generation_server.models import Model, get_model
 from text_generation_server.pb import generate_pb2_grpc, generate_pb2
 from text_generation_server.tracing import UDSOpenTelemetryAioServerInterceptor
-from text_generation_server.models.idefics_causal_lm import IdeficsCausalLMBatch
 
 
 class TextGenerationService(generate_pb2_grpc.TextGenerationServiceServicer):
-    def __init__(
-        self,
-        model: Model,
-        cache: Cache,
-        quantize: Optional[str],
-        server_urls: List[str],
-    ):
+    def __init__(self, model: Model, cache: Cache, server_urls: List[str]):
         self.cache = cache
         self.model = model
-        self.quantize = quantize
         self.server_urls = server_urls
         # For some reason, inference_mode does not work well with GLOO which we use on CPU
         if model.device.type == "cuda":
@@ -63,35 +54,9 @@ class TextGenerationService(generate_pb2_grpc.TextGenerationServiceServicer):
         return generate_pb2.FilterBatchResponse(batch=filtered_batch.to_pb())
 
     async def Warmup(self, request, context):
-        if self.quantize == "gptq":
-            try:
-                # When using GPTQ, Exllama kernels need some global kernels
-                # For which we have the finale shapes only after the model has loaded
-                # This will allocate those buffers.
-                from text_generation_server.utils.layers import (
-                    create_exllama_buffers,
-                    set_device,
-                )
-
-                set_device(self.model.device)
-                create_exllama_buffers(request.max_prefill_tokens)
-            except ImportError:
-                pass
-
-        if (
-            self.model.batch_type == IdeficsCausalLMBatch
-        ):  # Hack, i would rather use kwargs in the `from_pb` call
-            batch = self.model.batch_type.from_pb(
-                request.batch,
-                self.model.tokenizer,
-                self.model.processor,
-                self.model.dtype,
-                self.model.device,
-            )
-        else:
-            batch = self.model.batch_type.from_pb(
-                request.batch, self.model.tokenizer, self.model.dtype, self.model.device
-            )
+        batch = self.model.batch_type.from_pb(
+            request.batch, self.model.tokenizer, self.model.dtype, self.model.device
+        )
         max_supported_total_tokens = self.model.warmup(batch)
 
         return generate_pb2.WarmupResponse(
@@ -99,35 +64,19 @@ class TextGenerationService(generate_pb2_grpc.TextGenerationServiceServicer):
         )
 
     async def Prefill(self, request, context):
-        start = time.time_ns()
-        if (
-            self.model.batch_type == IdeficsCausalLMBatch
-        ):  # Hack, i would rather use kwargs in the `from_pb` call
-            batch = self.model.batch_type.from_pb(
-                request.batch,
-                self.model.tokenizer,
-                self.model.processor,
-                self.model.dtype,
-                self.model.device,
-            )
-        else:
-            batch = self.model.batch_type.from_pb(
-                request.batch, self.model.tokenizer, self.model.dtype, self.model.device
-            )
+        batch = self.model.batch_type.from_pb(
+            request.batch, self.model.tokenizer, self.model.dtype, self.model.device
+        )
 
-        generations, next_batch, timings = self.model.generate_token(batch)
+        generations, next_batch = self.model.generate_token(batch)
         self.cache.set(next_batch)
 
         return generate_pb2.PrefillResponse(
             generations=[generation.to_pb() for generation in generations],
             batch=next_batch.to_pb() if next_batch else None,
-            forward_ns=timings[0],
-            decode_ns=timings[1],
-            total_ns=time.time_ns() - start,
         )
 
     async def Decode(self, request, context):
-        start = time.time_ns()
         if len(request.batches) == 0:
             raise ValueError("Must provide at least one batch")
 
@@ -142,23 +91,16 @@ class TextGenerationService(generate_pb2_grpc.TextGenerationServiceServicer):
             raise ValueError("All batches are empty")
 
         if len(batches) > 1:
-            start_concat = time.time_ns()
             batch = self.model.batch_type.concatenate(batches)
-            concat_ns = time.time_ns() - start_concat
         else:
             batch = batches[0]
-            concat_ns = None
 
-        generations, next_batch, timings = self.model.generate_token(batch)
+        generations, next_batch = self.model.generate_token(batch)
         self.cache.set(next_batch)
 
         return generate_pb2.DecodeResponse(
             generations=[generation.to_pb() for generation in generations],
             batch=next_batch.to_pb() if next_batch else None,
-            concat_ns=concat_ns,
-            forward_ns=timings[0],
-            decode_ns=timings[1],
-            total_ns=time.time_ns() - start,
         )
 
 
@@ -167,7 +109,6 @@ def serve(
     revision: Optional[str],
     sharded: bool,
     quantize: Optional[str],
-    speculate: Optional[int],
     dtype: Optional[str],
     trust_remote_code: bool,
     uds_path: Path,
@@ -177,7 +118,6 @@ def serve(
         revision: Optional[str],
         sharded: bool = False,
         quantize: Optional[str] = None,
-        speculate: Optional[int] = None,
         dtype: Optional[str] = None,
         trust_remote_code: bool = False,
     ):
@@ -194,17 +134,26 @@ def serve(
 
         try:
             model = get_model(
-                model_id,
-                revision,
-                sharded,
-                quantize,
-                speculate,
-                dtype,
-                trust_remote_code,
+                model_id, revision, sharded, quantize, dtype, trust_remote_code
             )
         except Exception:
             logger.exception("Error when initializing model")
             raise
+
+        if quantize == "gptq":
+            try:
+                # When using GPTQ, Exllama kernels need some global kernels
+                # For which we have the finale shapes only after the model has loaded
+                # This will allocate those buffers.
+                from text_generation_server.utils.gptq.exllama import (
+                    create_exllama_buffers,
+                    set_device,
+                )
+
+                set_device(model.device)
+                create_exllama_buffers()
+            except ImportError:
+                pass
 
         server = aio.server(
             interceptors=[
@@ -213,7 +162,7 @@ def serve(
             ]
         )
         generate_pb2_grpc.add_TextGenerationServiceServicer_to_server(
-            TextGenerationService(model, Cache(), quantize, server_urls), server
+            TextGenerationService(model, Cache(), server_urls), server
         )
         SERVICE_NAMES = (
             generate_pb2.DESCRIPTOR.services_by_name["TextGenerationService"].full_name,
@@ -233,7 +182,5 @@ def serve(
             await server.stop(0)
 
     asyncio.run(
-        serve_inner(
-            model_id, revision, sharded, quantize, speculate, dtype, trust_remote_code
-        )
+        serve_inner(model_id, revision, sharded, quantize, dtype, trust_remote_code)
     )

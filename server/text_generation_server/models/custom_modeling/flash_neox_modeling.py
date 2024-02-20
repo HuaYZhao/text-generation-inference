@@ -91,8 +91,6 @@ class FlashNeoxAttention(torch.nn.Module):
         self.hidden_size = hidden_size
         self.head_size = hidden_size // num_heads
 
-        self.rotary_dim = int(config.rotary_pct * self.head_size)
-
         if self.num_heads % weights.process_group.size() != 0:
             raise ValueError(
                 f"`num_heads` must be divisible by `num_shards` (got `num_heads`: {self.num_heads} "
@@ -100,11 +98,8 @@ class FlashNeoxAttention(torch.nn.Module):
             )
         self.num_heads = self.num_heads // weights.process_group.size()
 
-        self.rotary_emb = PositionRotaryEmbedding.static(
-            config=config,
-            dim=self.rotary_dim,
-            base=config.rotary_emb_base,
-            device=weights.device,
+        self.rotary_emb = PositionRotaryEmbedding.load(
+            prefix=f"{prefix}.rotary_emb", weights=weights
         )
 
         self.softmax_scale = self.head_size ** (-0.5)
@@ -140,7 +135,8 @@ class FlashNeoxAttention(torch.nn.Module):
         qkv = qkv.view(-1, 3, self.num_heads, self.head_size)
 
         # Inplace rotary
-        self.rotary_emb(qkv[:, 0], qkv[:, 1], cos, sin)
+        self.rotary_emb(qkv[:, 0], cos, sin)
+        self.rotary_emb(qkv[:, 1], cos, sin)
 
         paged_attention.reshape_and_cache(
             qkv[:, 1], qkv[:, 2], kv_cache[0], kv_cache[1], slots
@@ -187,9 +183,9 @@ class FlashMLP(nn.Module):
             if "gelu" not in act
             else lambda x: torch.nn.functional.gelu(
                 x,
-                approximate=(
-                    "tanh" if act in ["gelu_fast", "gelu_pytorch_tanh"] else "none"
-                ),
+                approximate="tanh"
+                if act in ["gelu_fast", "gelu_pytorch_tanh"]
+                else "none",
             )
         )
 

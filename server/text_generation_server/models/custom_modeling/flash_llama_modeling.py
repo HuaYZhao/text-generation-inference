@@ -26,6 +26,9 @@ from transformers.activations import ACT2FN
 from transformers.configuration_utils import PretrainedConfig
 from typing import Optional, List, Tuple
 
+# Flash attention imports
+import dropout_layer_norm
+
 from text_generation_server.utils import paged_attention, flash_attn
 from text_generation_server.utils.layers import (
     TensorParallelRowLinear,
@@ -34,7 +37,6 @@ from text_generation_server.utils.layers import (
     PositionRotaryEmbedding,
     TensorParallelHead,
     get_linear,
-    FastRMSNorm,
 )
 
 
@@ -58,7 +60,6 @@ class LlamaConfig(PretrainedConfig):
         pretraining_tp=1,
         tie_word_embeddings=False,
         rope_scaling=None,
-        rope_theta=10000.0,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -79,7 +80,6 @@ class LlamaConfig(PretrainedConfig):
         self.pretraining_tp = pretraining_tp
         self.use_cache = use_cache
         self.rope_scaling = rope_scaling
-        self.rope_theta = rope_theta
 
         super().__init__(
             pad_token_id=pad_token_id,
@@ -90,25 +90,57 @@ class LlamaConfig(PretrainedConfig):
         )
 
 
-def load_attention(config, prefix, weights):
-    if config.num_attention_heads != config.num_key_value_heads:
-        return _load_gqa(config, prefix, weights)
-    else:
-        if config.model_type == "baichuan":
-            return TensorParallelColumnLinear.load_qkv(
-                config,
-                prefix=f"{prefix}.W_pack",
-                weights=weights,
-                bias=False,
+class LlamaRMSNorm(nn.Module):
+    def __init__(self, prefix, weights, eps=1e-6):
+        """
+        LlamaRMSNorm is equivalent to T5LayerNorm
+        """
+        super().__init__()
+
+        weight = weights.get_tensor(f"{prefix}.weight")
+        self.weight = nn.Parameter(weight)
+        self.variance_epsilon = eps
+
+    def forward(self, hidden_states, residual=None):
+        if hidden_states.shape[-1] > 8192:
+            if residual is not None:
+                hidden_states += residual
+            residual = hidden_states
+
+            hidden_states = hidden_states.to(torch.float32)
+            variance = hidden_states.pow(2).mean(-1, keepdim=True)
+            hidden_states = hidden_states * torch.rsqrt(
+                variance + self.variance_epsilon
             )
+
+            # convert into half-precision if necessary
+            if self.weight.dtype in [torch.float16, torch.bfloat16]:
+                hidden_states = hidden_states.to(self.weight.dtype)
+
+            return self.weight * hidden_states, residual
         else:
-            return TensorParallelColumnLinear.load_multi(
-                config,
-                prefixes=[f"{prefix}.q_proj", f"{prefix}.k_proj", f"{prefix}.v_proj"],
-                dim=0,
-                weights=weights,
-                bias=False,
+            # faster post attention rms norm
+            normed_hidden_states, res, *rest = dropout_layer_norm.dropout_add_ln_fwd(
+                hidden_states,
+                residual,
+                self.weight,
+                None,
+                None,
+                None,
+                None,
+                None,
+                0.0,
+                self.variance_epsilon,
+                1.0,
+                0,
+                None,
+                False,
+                True,  # Activate RMSNorm
             )
+            if res is None:
+                res = hidden_states
+
+            return normed_hidden_states, res
 
 
 def _load_gqa(config, prefix: str, weights):
@@ -121,7 +153,7 @@ def _load_gqa(config, prefix: str, weights):
         dim=0,
     )
 
-    if config.quantize not in ["gptq", "awq"]:
+    if config.quantize != "gptq":
         weight = weight.to(dtype=weights.dtype).to(device=weights.device)
 
         head_size = config.hidden_size // config.num_attention_heads
@@ -149,11 +181,8 @@ class FlashLlamaAttention(torch.nn.Module):
         self.hidden_size = config.hidden_size
         self.head_size = self.hidden_size // self.num_heads
 
-        self.rotary_emb = PositionRotaryEmbedding.static(
-            config=config,
-            dim=self.head_size,
-            base=config.rope_theta,
-            device=weights.device,
+        self.rotary_emb = PositionRotaryEmbedding.load(
+            prefix=f"{prefix}.rotary_emb", weights=weights
         )
 
         self.softmax_scale = self.head_size**-0.5
@@ -167,9 +196,16 @@ class FlashLlamaAttention(torch.nn.Module):
         self.num_key_value_heads = (
             config.num_key_value_heads // weights.process_group.size()
         )
-
-        self.query_key_value = load_attention(config, prefix, weights)
-
+        if config.num_attention_heads != config.num_key_value_heads:
+            self.query_key_value = _load_gqa(config, prefix, weights)
+        else:
+            self.query_key_value = TensorParallelColumnLinear.load_multi(
+                config,
+                prefixes=[f"{prefix}.q_proj", f"{prefix}.k_proj", f"{prefix}.v_proj"],
+                dim=0,
+                weights=weights,
+                bias=False,
+            )
         self.o_proj = TensorParallelRowLinear.load(
             config,
             prefix=f"{prefix}.o_proj",
@@ -204,7 +240,8 @@ class FlashLlamaAttention(torch.nn.Module):
         query = query.view(-1, self.num_heads, self.head_size)
         kv = kv.view(-1, 2, self.num_key_value_heads, self.head_size)
 
-        self.rotary_emb(query, torch.select(kv, dim=1, index=0), cos, sin)
+        self.rotary_emb(query, cos, sin)
+        self.rotary_emb(torch.select(kv, dim=1, index=0), cos, sin)
 
         paged_attention.reshape_and_cache(
             kv[:, 0], kv[:, 1], kv_cache[0], kv_cache[1], slots
@@ -251,9 +288,9 @@ class LlamaMLP(nn.Module):
             if "gelu" not in act
             else lambda x: torch.nn.functional.gelu(
                 x,
-                approximate=(
-                    "tanh" if act in ["gelu_fast", "gelu_pytorch_tanh"] else "none"
-                ),
+                approximate="tanh"
+                if act in ["gelu_fast", "gelu_pytorch_tanh"]
+                else "none",
             )
         )
         # Fuse gate and up proj
@@ -289,10 +326,10 @@ class FlashLlamaLayer(nn.Module):
         )
         self.mlp = LlamaMLP(prefix=f"{prefix}.mlp", config=config, weights=weights)
 
-        self.input_layernorm = FastRMSNorm.load(
+        self.input_layernorm = LlamaRMSNorm(
             prefix=f"{prefix}.input_layernorm", weights=weights, eps=config.rms_norm_eps
         )
-        self.post_attention_layernorm = FastRMSNorm.load(
+        self.post_attention_layernorm = LlamaRMSNorm(
             prefix=f"{prefix}.post_attention_layernorm",
             weights=weights,
             eps=config.rms_norm_eps,
@@ -356,7 +393,7 @@ class FlashLlamaModel(torch.nn.Module):
                 for layer_id in range(config.num_hidden_layers)
             ]
         )
-        self.norm = FastRMSNorm.load(
+        self.norm = LlamaRMSNorm(
             prefix="model.norm", weights=weights, eps=config.rms_norm_eps
         )
 

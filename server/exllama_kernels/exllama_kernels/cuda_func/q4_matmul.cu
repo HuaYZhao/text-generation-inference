@@ -1,13 +1,9 @@
 #include "q4_matmul.cuh"
 #include "column_remap.cuh"
-#include <ATen/cuda/CUDAContext.h>
 #include "../util.cuh"
 #include "../matrix.cuh"
-#include "../cu_compat.cuh"
+#include "../cuda_compat.cuh"
 #include "../cuda_buffers.cuh"
-#if defined(USE_ROCM)
-#include "../hip_compat.cuh"
-#endif
 
 const int THREADS_X = 32;       // Block size and thread count along columns in w and out
 const int THREADS_Y = 1;        // Block size and thread count along rows in x and out
@@ -86,7 +82,7 @@ __global__ void q4_matmul_kernel
             if constexpr (use_half2)
             {
                 half2 w_scale = w_scales_.item_half2half2(group, w_column);
-                uint32_t w_zero = (w_zeros_.item(group, w_column) + 1) & 0x0F;
+                uint32_t w_zero = w_zeros_.item(group, w_column) + 1;
 
                 if constexpr (use_x_map) acc = dot_product_8_x_map(acc, x_, x_row, k, w_, k, w_column, w_scale, w_zero, groupsize / 8, x_map);
                 else                     acc = dot_product_8      (acc, x_, x_row, k, w_, k, w_column, w_scale, w_zero, groupsize / 8);
@@ -94,7 +90,7 @@ __global__ void q4_matmul_kernel
             else
             {
                 half w_scale = w_scales_.item(group, w_column);
-                uint32_t w_zero = (w_zeros_.item(group, w_column) + 1) & 0x0F;
+                uint32_t w_zero = w_zeros_.item(group, w_column) + 1;
 
                 if constexpr (use_x_map) acc_h = dot_product_8_x_map_h(acc_h, x_, x_row, k, w_, k, w_column, w_scale, w_zero, groupsize / 8, x_map);
                 else                     acc_h = dot_product_8_h      (acc_h, x_, x_row, k, w_, k, w_column, w_scale, w_zero, groupsize / 8);
@@ -111,7 +107,7 @@ __global__ void q4_matmul_kernel
             {
                 int group = k / groupsize;
                 half2 w_scale = w_scales_.item_half2half2(group, w_column);
-                uint32_t w_zero = (w_zeros_.item(group, w_column) + 1) & 0x0F;
+                uint32_t w_zero = w_zeros_.item(group, w_column) + 1;
 
                 if constexpr (use_x_map) acc = dot_product_8_x_map(acc, x_, x_row, k, w_, k, w_column, w_scale, w_zero, 1, x_map);
                 else                     acc = dot_product_8      (acc, x_, x_row, k, w_, k, w_column, w_scale, w_zero, 1);
@@ -120,7 +116,7 @@ __global__ void q4_matmul_kernel
             {
                 int group = k / groupsize;
                 half w_scale = w_scales_.item(group, w_column);
-                uint32_t w_zero = (w_zeros_.item(group, w_column) + 1) & 0x0F;
+                uint32_t w_zero = w_zeros_.item(group, w_column) + 1;
 
                 if constexpr (use_x_map) acc_h = dot_product_8_x_map_h(acc_h, x_, x_row, k, w_, k, w_column, w_scale, w_zero, 1, x_map);
                 else                     acc_h = dot_product_8_h      (acc_h, x_, x_row, k, w_, k, w_column, w_scale, w_zero, 1);
@@ -132,7 +128,7 @@ __global__ void q4_matmul_kernel
 
     if constexpr (use_half2)
     {
-        half result = __hadd(__low2half(acc), __high2half(acc));
+        half result = __hadd(acc.x, acc.y);
         atomicAdd(out_.item_ptr(x_row, w_column), result);
     }
     else
@@ -225,8 +221,8 @@ void q4_matmul_recons_cuda
     const int x_height,
     Q4Matrix* w,
     half* out,
-    bool no_zero,
-    const cublasHandle_t handle
+    const cublasHandle_t handle,
+    bool no_zero
 )
 {
     int height = x_height;

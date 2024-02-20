@@ -182,7 +182,7 @@ try:
             )  # (BLOCK_SIZE_K, BLOCK_SIZE_N,)
 
             zeros = (zeros >> zeros_shifter[None, :]) & maxq
-            zeros = (zeros + 1) & maxq  # eventually avoid overflow
+            zeros = zeros + 1
 
             a = tl.load(a_ptrs, mask=a_mask, other=0.0)  # (BLOCK_SIZE_M, BLOCK_SIZE_K)
             b = tl.load(b_ptrs)  # (BLOCK_SIZE_K, BLOCK_SIZE_N), but repeated
@@ -263,7 +263,7 @@ class QuantLinear(nn.Module):
         self.groupsize = groupsize
 
         self.outfeatures = qweight.shape[1]
-        self.infeatures = qweight.shape[0] * 32 // bits
+        self.infeatures = qweight.shape[0] * 32 // 4
 
     @classmethod
     def new(cls, bits, groupsize, infeatures, outfeatures, bias):

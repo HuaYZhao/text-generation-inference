@@ -33,7 +33,7 @@ class GPTNeoxSharded(CausalLM):
             dtype = torch.float16 if dtype is None else dtype
         else:
             device = torch.device("cpu")
-            dtype = torch.float32 if dtype is None else dtype
+            dtype = torch.float32
 
         tokenizer = AutoTokenizer.from_pretrained(
             model_id,
@@ -57,7 +57,7 @@ class GPTNeoxSharded(CausalLM):
             filenames, device=device, dtype=dtype, process_group=self.process_group
         )
         if config.quantize == "gptq":
-            weights._set_gptq_params(model_id, revision)
+            weights._set_gptq_params(model_id)
 
         model = GPTNeoxForCausalLM(config, weights)
 

@@ -12,57 +12,57 @@
         },
         {
           "id": 3226,
-          "logprob": -8.5859375,
+          "logprob": -9.0234375,
           "text": " ge"
         },
         {
           "id": 21017,
-          "logprob": -7.5820312,
+          "logprob": -9.0859375,
           "text": "ometric"
         },
         {
           "id": 81,
-          "logprob": -0.26708984,
+          "logprob": -0.25927734,
           "text": "_"
         },
         {
           "id": 6009,
-          "logprob": -1.6386719,
+          "logprob": -2.25,
           "text": "mean"
         },
         {
           "id": 26,
-          "logprob": -0.22717285,
+          "logprob": -0.30126953,
           "text": "("
         },
         {
           "id": 62,
-          "logprob": -5.234375,
+          "logprob": -5.7539062,
           "text": "L"
         },
         {
           "id": 44,
-          "logprob": -3.1015625,
+          "logprob": -3.0878906,
           "text": ":"
         },
         {
           "id": 1682,
-          "logprob": -1.1083984,
+          "logprob": -0.6845703,
           "text": " List"
         },
         {
           "id": 77,
-          "logprob": -0.14294434,
+          "logprob": -0.3918457,
           "text": "["
         },
         {
           "id": 1808,
-          "logprob": -0.32592773,
+          "logprob": -0.8798828,
           "text": "float"
         },
         {
           "id": 10794,
-          "logprob": -2.8164062,
+          "logprob": -2.4980469,
           "text": "]):"
         }
       ],
@@ -70,68 +70,67 @@
       "tokens": [
         {
           "id": 284,
-          "logprob": -0.12817383,
+          "logprob": -1.1533203,
           "special": false,
           "text": "\n   "
         },
         {
-          "id": 1524,
-          "logprob": -0.9863281,
+          "id": 442,
+          "logprob": -0.91796875,
           "special": false,
-          "text": " \"\"\""
+          "text": " return"
         },
         {
-          "id": 284,
-          "logprob": -0.7011719,
+          "id": 3632,
+          "logprob": -1.3291016,
           "special": false,
-          "text": "\n   "
+          "text": " sum"
         },
         {
-          "id": 14883,
-          "logprob": -2.2050781,
+          "id": 26,
+          "logprob": -0.08062744,
           "special": false,
-          "text": " Calculate"
+          "text": "("
         },
         {
-          "id": 322,
-          "logprob": -0.2668457,
+          "id": 62,
+          "logprob": -0.097717285,
           "special": false,
-          "text": " the"
+          "text": "L"
         },
         {
-          "id": 3226,
-          "logprob": -0.08465576,
+          "id": 27,
+          "logprob": -0.29003906,
           "special": false,
-          "text": " ge"
+          "text": ")"
         },
         {
-          "id": 21017,
-          "logprob": -0.019012451,
+          "id": 517,
+          "logprob": -0.34958984,
           "special": false,
-          "text": "ometric"
+          "text": " /"
         },
         {
-          "id": 5651,
-          "logprob": -0.028625488,
+          "id": 2069,
+          "logprob": -0.03829956,
           "special": false,
-          "text": " mean"
+          "text": " len"
         },
         {
-          "id": 432,
-          "logprob": -0.29418945,
+          "id": 26,
+          "logprob": -0.0011987686,
           "special": false,
-          "text": " of"
+          "text": "("
         },
         {
-          "id": 312,
-          "logprob": -0.3161621,
+          "id": 62,
+          "logprob": -0.00050878525,
           "special": false,
-          "text": " a"
+          "text": "L"
         }
-      ],
-      "top_tokens": null
+      ]
     },
-    "generated_text": "\n    \"\"\"\n    Calculate the geometric mean of a"
+    "generated_text": "\n    return sum(L) / len(L"
   },
   {
     "details": {
@@ -146,57 +145,57 @@
         },
         {
           "id": 3226,
-          "logprob": -8.5859375,
+          "logprob": -9.0234375,
           "text": " ge"
         },
         {
           "id": 21017,
-          "logprob": -7.59375,
+          "logprob": -9.0859375,
           "text": "ometric"
         },
         {
           "id": 81,
-          "logprob": -0.26953125,
+          "logprob": -0.25878906,
           "text": "_"
         },
         {
           "id": 6009,
-          "logprob": -1.640625,
+          "logprob": -2.2109375,
           "text": "mean"
         },
         {
           "id": 26,
-          "logprob": -0.22705078,
+          "logprob": -0.30371094,
           "text": "("
         },
         {
           "id": 62,
-          "logprob": -5.234375,
+          "logprob": -5.6054688,
           "text": "L"
         },
         {
           "id": 44,
-          "logprob": -3.1132812,
+          "logprob": -3.0722656,
           "text": ":"
         },
         {
           "id": 1682,
-          "logprob": -1.1123047,
+          "logprob": -0.6879883,
           "text": " List"
         },
         {
           "id": 77,
-          "logprob": -0.14294434,
+          "logprob": -0.38500977,
           "text": "["
         },
         {
           "id": 1808,
-          "logprob": -0.32299805,
+          "logprob": -0.984375,
           "text": "float"
         },
         {
           "id": 10794,
-          "logprob": -2.8164062,
+          "logprob": -2.5351562,
           "text": "]):"
         }
       ],
@@ -204,68 +203,67 @@
       "tokens": [
         {
           "id": 284,
-          "logprob": -0.12854004,
+          "logprob": -1.1738281,
           "special": false,
           "text": "\n   "
         },
         {
-          "id": 1524,
-          "logprob": -0.9897461,
+          "id": 442,
+          "logprob": -0.9584961,
           "special": false,
-          "text": " \"\"\""
+          "text": " return"
         },
         {
-          "id": 284,
-          "logprob": -0.69970703,
+          "id": 3632,
+          "logprob": -1.4169922,
           "special": false,
-          "text": "\n   "
+          "text": " sum"
         },
         {
-          "id": 14883,
-          "logprob": -2.2050781,
+          "id": 26,
+          "logprob": -0.085876465,
           "special": false,
-          "text": " Calculate"
+          "text": "("
         },
         {
-          "id": 322,
-          "logprob": -0.2668457,
+          "id": 62,
+          "logprob": -0.0982666,
           "special": false,
-          "text": " the"
+          "text": "L"
         },
         {
-          "id": 3226,
-          "logprob": -0.08496094,
+          "id": 27,
+          "logprob": -0.3022461,
           "special": false,
-          "text": " ge"
+          "text": ")"
         },
         {
-          "id": 21017,
-          "logprob": -0.019012451,
+          "id": 517,
+          "logprob": -0.40504883,
           "special": false,
-          "text": "ometric"
+          "text": " /"
         },
         {
-          "id": 5651,
-          "logprob": -0.029037476,
+          "id": 2069,
+          "logprob": -0.041656494,
           "special": false,
-          "text": " mean"
+          "text": " len"
         },
         {
-          "id": 432,
-          "logprob": -0.2939453,
+          "id": 26,
+          "logprob": -0.0011844635,
           "special": false,
-          "text": " of"
+          "text": "("
         },
         {
-          "id": 312,
-          "logprob": -0.31591797,
+          "id": 62,
+          "logprob": -0.0005264282,
           "special": false,
-          "text": " a"
+          "text": "L"
         }
-      ],
-      "top_tokens": null
+      ]
     },
-    "generated_text": "\n    \"\"\"\n    Calculate the geometric mean of a"
+    "generated_text": "\n    return sum(L) / len(L"
   },
   {
     "details": {
@@ -280,57 +278,57 @@
         },
         {
           "id": 3226,
-          "logprob": -8.5859375,
+          "logprob": -9.0234375,
           "text": " ge"
         },
         {
           "id": 21017,
-          "logprob": -7.5859375,
+          "logprob": -9.0859375,
           "text": "ometric"
         },
         {
           "id": 81,
-          "logprob": -0.26586914,
+          "logprob": -0.25927734,
           "text": "_"
         },
         {
           "id": 6009,
-          "logprob": -1.6347656,
+          "logprob": -2.25,
           "text": "mean"
         },
         {
           "id": 26,
-          "logprob": -0.22766113,
+          "logprob": -0.30126953,
           "text": "("
         },
         {
           "id": 62,
-          "logprob": -5.2265625,
+          "logprob": -5.7539062,
           "text": "L"
         },
         {
           "id": 44,
-          "logprob": -3.0976562,
+          "logprob": -3.0878906,
           "text": ":"
         },
         {
           "id": 1682,
-          "logprob": -1.1025391,
+          "logprob": -0.6845703,
           "text": " List"
         },
         {
           "id": 77,
-          "logprob": -0.1427002,
+          "logprob": -0.3918457,
           "text": "["
         },
         {
           "id": 1808,
-          "logprob": -0.32592773,
+          "logprob": -0.8798828,
           "text": "float"
         },
         {
           "id": 10794,
-          "logprob": -2.8164062,
+          "logprob": -2.4980469,
           "text": "]):"
         }
       ],
@@ -338,68 +336,67 @@
       "tokens": [
         {
           "id": 284,
-          "logprob": -0.13012695,
+          "logprob": -1.1533203,
           "special": false,
           "text": "\n   "
         },
         {
-          "id": 1524,
-          "logprob": -0.98046875,
+          "id": 442,
+          "logprob": -0.9165039,
           "special": false,
-          "text": " \"\"\""
+          "text": " return"
         },
         {
-          "id": 284,
-          "logprob": -0.69921875,
+          "id": 3632,
+          "logprob": -1.328125,
           "special": false,
-          "text": "\n   "
+          "text": " sum"
         },
         {
-          "id": 14883,
-          "logprob": -2.1992188,
+          "id": 26,
+          "logprob": -0.07946777,
           "special": false,
-          "text": " Calculate"
+          "text": "("
         },
         {
-          "id": 322,
-          "logprob": -0.2668457,
+          "id": 62,
+          "logprob": -0.09820557,
           "special": false,
-          "text": " the"
+          "text": "L"
         },
         {
-          "id": 3226,
-          "logprob": -0.083496094,
+          "id": 27,
+          "logprob": -0.28930664,
           "special": false,
-          "text": " ge"
+          "text": ")"
         },
         {
-          "id": 21017,
-          "logprob": -0.01902771,
+          "id": 517,
+          "logprob": -0.34592773,
           "special": false,
-          "text": "ometric"
+          "text": " /"
         },
         {
-          "id": 5651,
-          "logprob": -0.029006958,
+          "id": 2069,
+          "logprob": -0.038330078,
           "special": false,
-          "text": " mean"
+          "text": " len"
         },
         {
-          "id": 432,
-          "logprob": -0.29248047,
+          "id": 26,
+          "logprob": -0.0011940002,
           "special": false,
-          "text": " of"
+          "text": "("
         },
         {
-          "id": 312,
-          "logprob": -0.3161621,
+          "id": 62,
+          "logprob": -0.00050878525,
           "special": false,
-          "text": " a"
+          "text": "L"
         }
-      ],
-      "top_tokens": null
+      ]
     },
-    "generated_text": "\n    \"\"\"\n    Calculate the geometric mean of a"
+    "generated_text": "\n    return sum(L) / len(L"
   },
   {
     "details": {
@@ -414,57 +411,57 @@
         },
         {
           "id": 3226,
-          "logprob": -8.5859375,
+          "logprob": -9.0234375,
           "text": " ge"
         },
         {
           "id": 21017,
-          "logprob": -7.5859375,
+          "logprob": -9.0859375,
           "text": "ometric"
         },
         {
           "id": 81,
-          "logprob": -0.26904297,
+          "logprob": -0.25927734,
           "text": "_"
         },
         {
           "id": 6009,
-          "logprob": -1.6386719,
+          "logprob": -2.25,
           "text": "mean"
         },
         {
           "id": 26,
-          "logprob": -0.22705078,
+          "logprob": -0.30126953,
           "text": "("
         },
         {
           "id": 62,
-          "logprob": -5.234375,
+          "logprob": -5.7539062,
           "text": "L"
         },
         {
           "id": 44,
-          "logprob": -3.1132812,
+          "logprob": -3.0878906,
           "text": ":"
         },
         {
           "id": 1682,
-          "logprob": -1.1074219,
+          "logprob": -0.6845703,
           "text": " List"
         },
         {
           "id": 77,
-          "logprob": -0.14477539,
+          "logprob": -0.3918457,
           "text": "["
         },
         {
           "id": 1808,
-          "logprob": -0.3256836,
+          "logprob": -0.8798828,
           "text": "float"
         },
         {
           "id": 10794,
-          "logprob": -2.8027344,
+          "logprob": -2.4980469,
           "text": "]):"
         }
       ],
@@ -472,67 +469,66 @@
       "tokens": [
         {
           "id": 284,
-          "logprob": -0.12915039,
+          "logprob": -1.1533203,
           "special": false,
           "text": "\n   "
         },
         {
-          "id": 1524,
-          "logprob": -0.98535156,
+          "id": 442,
+          "logprob": -0.91259766,
           "special": false,
-          "text": " \"\"\""
+          "text": " return"
         },
         {
-          "id": 284,
-          "logprob": -0.69921875,
+          "id": 3632,
+          "logprob": -1.3251953,
           "special": false,
-          "text": "\n   "
+          "text": " sum"
         },
         {
-          "id": 14883,
-          "logprob": -2.2011719,
+          "id": 26,
+          "logprob": -0.08062744,
           "special": false,
-          "text": " Calculate"
+          "text": "("
         },
         {
-          "id": 322,
-          "logprob": -0.26708984,
+          "id": 62,
+          "logprob": -0.09906006,
           "special": false,
-          "text": " the"
+          "text": "L"
         },
         {
-          "id": 3226,
-          "logprob": -0.08502197,
+          "id": 27,
+          "logprob": -0.28979492,
           "special": false,
-          "text": " ge"
+          "text": ")"
         },
         {
-          "id": 21017,
-          "logprob": -0.019012451,
+          "id": 517,
+          "logprob": -0.35958984,
           "special": false,
-          "text": "ometric"
+          "text": " /"
         },
         {
-          "id": 5651,
-          "logprob": -0.028625488,
+          "id": 2069,
+          "logprob": -0.038604736,
           "special": false,
-          "text": " mean"
+          "text": " len"
         },
         {
-          "id": 432,
-          "logprob": -0.29589844,
+          "id": 26,
+          "logprob": -0.0011901855,
           "special": false,
-          "text": " of"
+          "text": "("
         },
         {
-          "id": 312,
-          "logprob": -0.31591797,
+          "id": 62,
+          "logprob": -0.0005078316,
           "special": false,
-          "text": " a"
+          "text": "L"
         }
-      ],
-      "top_tokens": null
+      ]
     },
-    "generated_text": "\n    \"\"\"\n    Calculate the geometric mean of a"
+    "generated_text": "\n    return sum(L) / len(L"
   }
 ]

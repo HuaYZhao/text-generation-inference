@@ -40,10 +40,7 @@ from text_generation_server.utils.layers import (
 )
 
 CUSTOM_KERNELS_ENABLED = False
-if (
-    torch.cuda.is_available()
-    and not os.environ.get("DISABLE_CUSTOM_KERNELS", "False") == "True"
-):
+if not os.environ.get("DISABLE_CUSTOM_KERNELS", "False") == "True":
     try:
         from custom_kernels import fused_bloom_attention_cuda
 

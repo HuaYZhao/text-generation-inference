@@ -6,6 +6,7 @@ from transformers.activations import ACT2FN
 from typing import Optional, List, Tuple
 
 from text_generation_server.utils import paged_attention, flash_attn
+from text_generation_server.utils.flash_attn import attention
 from text_generation_server.utils.layers import (
     TensorParallelRowLinear,
     TensorParallelColumnLinear,
@@ -14,6 +15,7 @@ from text_generation_server.utils.layers import (
     FastLayerNorm,
     get_linear,
 )
+from safetensors import SafetensorError
 
 
 def load_multi_mqa(
@@ -69,22 +71,9 @@ def _load_multi_mqa_gptq(
         qzeros = torch.cat([q_tensor, kv_tensor], dim=1)
         qzeros = qzeros.to(device=weights.device)
 
-        (
-            bits,
-            groupsize,
-            _,
-            quant_method,
-        ) = weights._get_gptq_params()
-        if quant_method == "gptq":
-            g_idx = weights.get_tensor(f"{prefix}.c_attn.g_idx")
-            g_idx = g_idx.to(device=weights.device)
-        elif quant_method == "awq":
-            g_idx = None
-            from text_generation_server.utils.awq.conversion_utils import (
-                fast_awq_to_gptq,
-            )
-
-            qweight, qzeros = fast_awq_to_gptq(qweight, qzeros)
+        g_idx = weights.get_tensor(f"{prefix}.c_attn.g_idx")
+        g_idx = g_idx.to(device=weights.device)
+        bits, groupsize = weights._get_gptq_params()
 
         from text_generation_server.utils.layers import HAS_EXLLAMA
 
@@ -311,9 +300,9 @@ class MLP(nn.Module):
             if "gelu" not in act
             else lambda x: torch.nn.functional.gelu(
                 x,
-                approximate=(
-                    "tanh" if act in ["gelu_fast", "gelu_pytorch_tanh"] else "none"
-                ),
+                approximate="tanh"
+                if act in ["gelu_fast", "gelu_pytorch_tanh"]
+                else "none",
             )
         )
 

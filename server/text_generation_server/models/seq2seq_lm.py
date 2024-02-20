@@ -1,18 +1,16 @@
 import torch
-import time
 
 from dataclasses import dataclass
 from opentelemetry import trace
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, PreTrainedTokenizerBase
 from typing import Optional, Tuple, List, Type, Dict
 
-from text_generation_server.utils.tokens import batch_top_tokens
 from text_generation_server.models import Model
 from text_generation_server.models.types import (
     GeneratedText,
     Batch,
     Generation,
-    Tokens,
+    PrefillTokens,
 )
 from text_generation_server.pb import generate_pb2
 from text_generation_server.utils import NextTokenChooser, StoppingCriteria, Sampling
@@ -50,8 +48,6 @@ class Seq2SeqLMBatch(Batch):
     # Generation helpers
     next_token_choosers: List[NextTokenChooser]
     stopping_criterias: List[StoppingCriteria]
-    top_n_tokens: List[int]
-    top_n_tokens_tensor: torch.Tensor
 
     # Metadata used for padding
     max_input_length: int
@@ -82,7 +78,7 @@ class Seq2SeqLMBatch(Batch):
         inputs = []
         next_token_choosers = []
         stopping_criterias = []
-        top_n_tokens = []
+
         decoder_input_lengths = []
         prefix_offsets = []
         read_offsets = []
@@ -96,14 +92,11 @@ class Seq2SeqLMBatch(Batch):
             inputs.append(r.inputs)
             requests_idx_mapping[r.id] = i
             decoder_input_lengths.append(1)
-            next_token_choosers.append(
-                NextTokenChooser.from_pb(r.parameters, device, tokenizer)
-            )
+            next_token_choosers.append(NextTokenChooser.from_pb(r.parameters, device))
             stopping_criteria = StoppingCriteria.from_pb(
                 r.stopping_parameters, tokenizer
             )
             stopping_criterias.append(stopping_criteria)
-            top_n_tokens.append(r.top_n_tokens)
             max_truncation = max(max_truncation, r.truncate)
             max_decode_tokens += stopping_criteria.max_new_tokens
             padding_right_offset = max(
@@ -133,9 +126,6 @@ class Seq2SeqLMBatch(Batch):
             prefix_offsets.append(0)
             read_offsets.append(1)
         all_decoder_input_ids = decoder_input_ids.view(-1).split(1)
-        top_n_tokens_tensor = torch.tensor(
-            top_n_tokens, device=device, dtype=torch.int64
-        )
 
         max_tokens = len(inputs) * (max_input_length + max_decode_tokens)
 
@@ -156,8 +146,6 @@ class Seq2SeqLMBatch(Batch):
             read_offsets=read_offsets,
             next_token_choosers=next_token_choosers,
             stopping_criterias=stopping_criterias,
-            top_n_tokens=top_n_tokens,
-            top_n_tokens_tensor=top_n_tokens_tensor,
             max_input_length=max_input_length.item(),
             max_decoder_input_length=1,
             padding_right_offset=padding_right_offset,
@@ -185,7 +173,6 @@ class Seq2SeqLMBatch(Batch):
 
         next_token_choosers = []
         stopping_criterias = []
-        top_n_tokens = []
 
         max_input_length = 0
         max_decoder_input_length = 0
@@ -217,7 +204,6 @@ class Seq2SeqLMBatch(Batch):
             next_token_choosers.append(self.next_token_choosers[idx])
             stopping_criteria = self.stopping_criterias[idx]
             stopping_criterias.append(stopping_criteria)
-            top_n_tokens.append(self.top_n_tokens[idx])
             remaining_decode_tokens = (
                 stopping_criteria.max_new_tokens - stopping_criteria.current_tokens
             )
@@ -253,7 +239,6 @@ class Seq2SeqLMBatch(Batch):
             layer[2] = layer[2][keep_indices, :, -max_input_length:]
             layer[3] = layer[3][keep_indices, :, -max_input_length:]
 
-        top_n_tokens_tensor = self.top_n_tokens_tensor[keep_indices]
         max_tokens = (
             len(request_ids) * (max_input_length + max_decoder_input_length)
             + remaining_decode_tokens
@@ -269,8 +254,6 @@ class Seq2SeqLMBatch(Batch):
         self.read_offsets = read_offsets
         self.next_token_choosers = next_token_choosers
         self.stopping_criterias = stopping_criterias
-        self.top_n_tokens = top_n_tokens
-        self.top_n_tokens_tensor = top_n_tokens_tensor
         self.max_input_length = max_input_length
         self.max_decoder_input_length = max_decoder_input_length
         self.padding_right_offset = padding_right_offset
@@ -306,7 +289,6 @@ class Seq2SeqLMBatch(Batch):
         read_offsets = []
         next_token_choosers = []
         stopping_criterias = []
-        top_n_tokens = []
         max_tokens = 0
 
         # Batch tensors
@@ -314,7 +296,6 @@ class Seq2SeqLMBatch(Batch):
         decoder_input_ids = None
         decoder_attention_mask = None
         encoder_last_hidden_state = None
-        top_n_tokens_tensor = None
         past_key_values = []
 
         # Used for slicing correctly inside the tensors
@@ -331,7 +312,6 @@ class Seq2SeqLMBatch(Batch):
             read_offsets.extend(batch.read_offsets)
             next_token_choosers.extend(batch.next_token_choosers)
             stopping_criterias.extend(batch.stopping_criterias)
-            top_n_tokens.extend(batch.top_n_tokens)
 
             if i == 0:
                 requests_idx_mapping = batch.requests_idx_mapping
@@ -353,9 +333,9 @@ class Seq2SeqLMBatch(Batch):
                     (total_batch_size, max_input_length),
                 )
             # Copy to correct indices
-            attention_mask[start_index:end_index, -batch.max_input_length :] = (
-                batch.attention_mask[:, -batch.max_input_length :]
-            )
+            attention_mask[
+                start_index:end_index, -batch.max_input_length :
+            ] = batch.attention_mask[:, -batch.max_input_length :]
 
             # Create padded tensor
             if decoder_input_ids is None:
@@ -403,12 +383,6 @@ class Seq2SeqLMBatch(Batch):
                         batch.encoder_last_hidden_state.shape[-1],
                     ),
                 )
-
-            if top_n_tokens_tensor is None:
-                top_n_tokens_tensor = batches[0].top_n_tokens_tensor.new_zeros(
-                    total_batch_size,
-                )
-            top_n_tokens_tensor[start_index:end_index] = batch.top_n_tokens_tensor
 
             # Copy to correct indices
             encoder_last_hidden_state[
@@ -514,8 +488,6 @@ class Seq2SeqLMBatch(Batch):
             read_offsets=read_offsets,
             next_token_choosers=next_token_choosers,
             stopping_criterias=stopping_criterias,
-            top_n_tokens=top_n_tokens,
-            top_n_tokens_tensor=top_n_tokens_tensor,
             max_input_length=max_input_length,
             max_decoder_input_length=max_decoder_input_length,
             padding_right_offset=padding_right_offset,
@@ -543,17 +515,15 @@ class Seq2SeqLM(Model):
                 raise ValueError("quantization is not available on CPU")
 
             device = torch.device("cpu")
-            dtype = torch.float32 if dtype is None else dtype
+            dtype = torch.float32
 
         model = AutoModelForSeq2SeqLM.from_pretrained(
             model_id,
             revision=revision,
             torch_dtype=dtype,
-            device_map=(
-                "auto"
-                if torch.cuda.is_available() and torch.cuda.device_count() > 1
-                else None
-            ),
+            device_map="auto"
+            if torch.cuda.is_available() and torch.cuda.device_count() > 1
+            else None,
             load_in_8bit=quantize == "bitsandbytes",
             trust_remote_code=trust_remote_code,
         )
@@ -618,8 +588,7 @@ class Seq2SeqLM(Model):
     @tracer.start_as_current_span("generate_token")
     def generate_token(
         self, batch: Seq2SeqLMBatch
-    ) -> Tuple[List[Generation], Optional[Seq2SeqLMBatch], Tuple[int, int]]:
-        start = time.time_ns()
+    ) -> Tuple[List[Generation], Optional[Seq2SeqLMBatch]]:
         if batch.decoder_attention_mask is not None:
             # slice to the correct shape
             decoder_attention_mask = batch.decoder_attention_mask[
@@ -644,17 +613,6 @@ class Seq2SeqLM(Model):
             batch.past_key_values,
         )
 
-        # Speculation is not active for seq2seq
-        accepted_ids = torch.ones_like(batch.decoder_input_ids)[:, 0]
-        batch_top_token_ids, batch_top_token_logprobs = batch_top_tokens(
-            batch.top_n_tokens,
-            batch.top_n_tokens_tensor,
-            torch.log_softmax(logits[:, -1], -1),
-            accepted_ids,
-        )
-
-        start_decode = time.time_ns()
-
         # Finished requests
         generations: List[Generation] = []
         stopped = True
@@ -670,9 +628,6 @@ class Seq2SeqLM(Model):
             batch.next_token_choosers,
             batch.stopping_criterias,
             batch.all_decoder_input_ids,
-            batch.top_n_tokens,
-            batch_top_token_ids,
-            batch_top_token_logprobs,
         )
 
         # For each member of the batch
@@ -686,9 +641,6 @@ class Seq2SeqLM(Model):
             next_token_chooser,
             stopping_criteria,
             all_decoder_input_ids,
-            top_n_tokens,
-            top_token_ids,
-            top_token_logprobs,
         ) in enumerate(iterator):
             # Select next token
             next_token_id, logprobs = next_token_chooser(
@@ -720,13 +672,8 @@ class Seq2SeqLM(Model):
                 if stop:
                     # Slice with decoder_input_length to remove padding
                     # Decode all tokens
-                    output_text, _, _ = self.decode_token(
-                        all_decoder_input_ids,
-                        prefix_offset=len(all_decoder_input_ids)
-                        - decoder_input_length
-                        - 1,
-                        read_offset=len(all_decoder_input_ids) - decoder_input_length,
-                        skip_special_tokens=True,
+                    output_text = self.decode(
+                        all_decoder_input_ids[-decoder_input_length:]
                     )
 
                     # Get seed
@@ -743,59 +690,27 @@ class Seq2SeqLM(Model):
 
                 # Prefill
                 if stopping_criteria.current_tokens == 1 and request.prefill_logprobs:
-                    prefill_tokens = Tokens(
+                    prefill_tokens = PrefillTokens(
                         [self.tokenizer.bos_token_id],
                         [float("nan")],
                         [self.tokenizer.bos_token],
-                        [False],
                     )
                 else:
                     prefill_tokens = None
 
-                if top_n_tokens > 0:
-                    all_top_tokens = []
-                    for top_token_ids, top_token_logprobs in zip(
-                        top_token_ids, top_token_logprobs
-                    ):
-                        toptoken_texts = self.tokenizer.batch_decode(
-                            top_token_ids,
-                            clean_up_tokenization_spaces=False,
-                            skip_special_tokens=False,
-                        )
-                        special_toptokens = [
-                            token_id in self.all_special_ids
-                            for token_id in top_token_ids
-                        ]
-                        top_tokens = Tokens(
-                            top_token_ids,
-                            top_token_logprobs,
-                            toptoken_texts,
-                            special_toptokens,
-                        )
-                        all_top_tokens.append(top_tokens)
-                    top_tokens = all_top_tokens
-                else:
-                    top_tokens = None
-
                 generation = Generation(
                     request.id,
                     prefill_tokens,
-                    Tokens(
-                        [next_token_id_squeezed],
-                        [next_token_logprob],
-                        [next_token_text],
-                        [next_token_id_squeezed.item() in self.all_special_ids],
-                    ),
+                    next_token_id_squeezed,
+                    next_token_logprob,
+                    next_token_text,
+                    next_token_id_squeezed.item() in self.all_special_ids,
                     generated_text,
-                    top_tokens,
                 )
 
                 generations.append(generation)
 
             # Update values
-            batch.next_token_choosers[i] = batch.next_token_choosers[i].advance_grammar(
-                next_token_id_squeezed.item()
-            )
             batch.decoder_input_ids[i] = next_token_id
             batch.all_decoder_input_ids[i] = all_decoder_input_ids
             batch.input_lengths[i] = input_length
@@ -809,9 +724,7 @@ class Seq2SeqLM(Model):
 
         # We finished all generations in the batch; there is no next batch
         if stopped:
-            forward_ns = start_decode - start
-            decode_ns = time.time_ns() - start_decode
-            return generations, None, (forward_ns, decode_ns)
+            return generations, None
 
         # We don't need input_ids after the prefill forward
         batch.input_ids = None
@@ -822,6 +735,4 @@ class Seq2SeqLM(Model):
             batch.decoder_attention_mask[:, -batch.padding_right_offset] = 1
         batch.padding_right_offset -= 1
 
-        forward_ns = start_decode - start
-        decode_ns = time.time_ns() - start_decode
-        return generations, batch, (forward_ns, decode_ns)
+        return generations, batch

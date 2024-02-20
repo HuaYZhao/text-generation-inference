@@ -23,7 +23,7 @@ class RW(CausalLM):
                 raise ValueError("quantization is not available on CPU")
 
             device = torch.device("cpu")
-            dtype = torch.float32 if dtype is None else dtype
+            dtype = torch.float32
 
         tokenizer = AutoTokenizer.from_pretrained(
             model_id,
@@ -36,11 +36,9 @@ class RW(CausalLM):
             model_id,
             revision=revision,
             torch_dtype=dtype,
-            device_map=(
-                "auto"
-                if torch.cuda.is_available() and torch.cuda.device_count() > 1
-                else None
-            ),
+            device_map="auto"
+            if torch.cuda.is_available() and torch.cuda.device_count() > 1
+            else None,
             load_in_8bit=quantize == "bitsandbytes",
             trust_remote_code=trust_remote_code,
         )
@@ -69,6 +67,18 @@ class RW(CausalLM):
         self, input_ids, attention_mask, position_ids, past_key_values: Optional = None
     ) -> Tuple[torch.Tensor, List[Tuple[torch.Tensor, torch.Tensor]]]:
         # Model Forward
+        if past_key_values is not None:
+            reshaped_past_key_values = []
+            for layer in past_key_values:
+                past_keys, past_values = layer
+                reshaped_past_key_values.append(
+                    (
+                        past_keys.view(-1, *past_keys.shape[-2:]),
+                        past_values.view(-1, *past_values.shape[-2:]),
+                    )
+                )
+            past_key_values = reshaped_past_key_values
+
         outputs = self.model.forward(
             input_ids=input_ids,
             attention_mask=attention_mask,

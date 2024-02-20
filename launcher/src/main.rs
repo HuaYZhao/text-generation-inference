@@ -4,7 +4,7 @@ use nix::unistd::Pid;
 use serde::Deserialize;
 use std::env;
 use std::ffi::OsString;
-use std::io::{BufRead, BufReader, Lines};
+use std::io::{BufRead, BufReader, Lines, Read};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -21,57 +21,19 @@ mod env_runtime;
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum Quantization {
-    /// 4 bit quantization. Requires a specific AWQ quantized model:
-    ///   https://hf.co/models?search=awq.
-    /// Should replace GPTQ models wherever possible because of the better latency
-    Awq,
-    /// 8 bit quantization, doesn't require specific model.
-    /// Should be a drop-in replacement to bitsandbytes with much better performance.
-    /// Kernels are from https://github.com/NetEase-FuXi/EETQ.git
-    Eetq,
-    /// 4 bit quantization. Requires a specific GTPQ quantized model: https://hf.co/models?search=gptq.
-    /// text-generation-inference will use exllama (faster) kernels wherever possible, and use
-    /// triton kernel (wider support) when it's not.
-    /// AWQ has faster kernels.
-    Gptq,
-    /// Bitsandbytes 8bit. Can be applied on any model, will cut the memory requirement in half,
-    /// but it is known that the model will be much slower to run than the native f16.
-    #[deprecated(
-        since = "1.1.0",
-        note = "Use `eetq` instead, which provides better latencies overall and is drop-in in most cases"
-    )]
     Bitsandbytes,
-    /// Bitsandbytes 4bit. Can be applied on any model, will cut the memory requirement by 4x,
-    /// but it is known that the model will be much slower to run than the native f16.
-    BitsandbytesNF4,
-    /// Bitsandbytes 4bit. nf4 should be preferred in most cases but maybe this one has better
-    /// perplexity performance for you model
-    BitsandbytesFP4,
+    Gptq,
 }
 
 impl std::fmt::Display for Quantization {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // To keep in track with `server`.
         match self {
-            #[allow(deprecated)]
-            // Use `eetq` instead, which provides better latencies overall and is drop-in in most cases
             Quantization::Bitsandbytes => {
                 write!(f, "bitsandbytes")
             }
-            Quantization::BitsandbytesNF4 => {
-                write!(f, "bitsandbytes-nf4")
-            }
-            Quantization::BitsandbytesFP4 => {
-                write!(f, "bitsandbytes-fp4")
-            }
             Quantization::Gptq => {
                 write!(f, "gptq")
-            }
-            Quantization::Awq => {
-                write!(f, "awq")
-            }
-            Quantization::Eetq => {
-                write!(f, "eetq")
             }
         }
     }
@@ -93,26 +55,6 @@ impl std::fmt::Display for Dtype {
             }
             Dtype::BFloat16 => {
                 write!(f, "bfloat16")
-            }
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, ValueEnum)]
-enum RopeScaling {
-    Linear,
-    Dynamic,
-}
-
-impl std::fmt::Display for RopeScaling {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // To keep in track with `server`.
-        match self {
-            RopeScaling::Linear => {
-                write!(f, "linear")
-            }
-            RopeScaling::Dynamic => {
-                write!(f, "dynamic")
             }
         }
     }
@@ -153,16 +95,10 @@ struct Args {
     #[clap(long, env)]
     num_shard: Option<usize>,
 
-    /// Whether you want the model to be quantized.
+    /// Whether you want the model to be quantized. This will use `bitsandbytes` for
+    /// quantization on the fly, or `gptq`.
     #[clap(long, env, value_enum)]
     quantize: Option<Quantization>,
-
-    /// The number of input_ids to speculate on
-    /// If using a medusa model, the heads will be picked up automatically
-    /// Other wise, it will use n-gram speculation which is relatively free
-    /// in terms of compute, but the speedup heavily depends on the task.
-    #[clap(long, env)]
-    speculate: Option<usize>,
 
     /// The dtype to be forced upon the model. This option cannot be used with `--quantize`.
     #[clap(long, env, value_enum)]
@@ -193,14 +129,6 @@ struct Args {
     /// their prompt.
     #[clap(default_value = "4", long, env)]
     max_stop_sequences: usize,
-
-    /// This is the maximum allowed value for clients to set `top_n_tokens`.
-    /// `top_n_tokens is used to return information about the the `n` most likely
-    /// tokens at each generation step, instead of just the sampled token. This
-    /// information can be used for downstream tasks like for classification or
-    /// ranking.
-    #[clap(default_value = "5", long, env)]
-    max_top_n_tokens: u32,
 
     /// This is the maximum allowed input length (expressed in number of tokens)
     /// for users. The larger this value, the longer prompt users can send which
@@ -279,15 +207,6 @@ struct Args {
     #[clap(default_value = "20", long, env)]
     max_waiting_tokens: usize,
 
-    /// Enforce a maximum number of requests per batch
-    /// Specific flag for hardware targets that do not support unpadded inference
-    #[clap(long, env)]
-    max_batch_size: Option<usize>,
-
-    /// Enable experimental support for cuda graphs
-    #[clap(long, env)]
-    enable_cuda_graphs: bool,
-
     /// The IP address to listen on
     #[clap(default_value = "0.0.0.0", long, env)]
     hostname: String,
@@ -331,26 +250,6 @@ struct Args {
     #[clap(default_value = "1.0", long, env)]
     cuda_memory_fraction: f32,
 
-    /// Rope scaling will only be used for RoPE models
-    /// and allow rescaling the position rotary to accomodate for
-    /// larger prompts.
-    ///
-    /// Goes together with `rope_factor`.
-    ///
-    /// `--rope-factor 2.0` gives linear scaling with a factor of 2.0
-    /// `--rope-scaling dynamic` gives dynamic scaling with a factor of 1.0
-    /// `--rope-scaling linear` gives linear scaling with a factor of 1.0 (Nothing will be changed
-    /// basically)
-    ///
-    /// `--rope-scaling linear --rope-factor` fully describes the scaling you want
-    #[clap(long, env)]
-    rope_scaling: Option<RopeScaling>,
-
-    /// Rope scaling will only be used for RoPE models
-    /// See `rope_scaling`
-    #[clap(long, env)]
-    rope_factor: Option<f32>,
-
     /// Outputs the logs in JSON format (useful for telemetry)
     #[clap(long, env)]
     json_output: bool,
@@ -377,16 +276,6 @@ struct Args {
     #[clap(long, env)]
     ngrok_edge: Option<String>,
 
-    /// The path to the tokenizer config file. This path is used to load the tokenizer configuration which may
-    /// include a `chat_template`. If not provided, the default config will be used from the model hub.
-    #[clap(long, env)]
-    tokenizer_config_path: Option<String>,
-
-    /// Disable outlines grammar constrained generation.
-    /// This is a feature that allows you to generate text that follows a specific grammar.
-    #[clap(long, env)]
-    disable_grammar_support: bool,
-
     /// Display a lot of information about your runtime environment
     #[clap(long, short, action)]
     env: bool,
@@ -403,7 +292,6 @@ fn shard_manager(
     model_id: String,
     revision: Option<String>,
     quantize: Option<Quantization>,
-    speculate: Option<usize>,
     dtype: Option<Dtype>,
     trust_remote_code: bool,
     uds_path: String,
@@ -416,10 +304,7 @@ fn shard_manager(
     disable_custom_kernels: bool,
     watermark_gamma: Option<f32>,
     watermark_delta: Option<f32>,
-    enable_cuda_graphs: bool,
     cuda_memory_fraction: f32,
-    rope_scaling: Option<RopeScaling>,
-    rope_factor: Option<f32>,
     otlp_endpoint: Option<String>,
     status_sender: mpsc::Sender<ShardStatus>,
     shutdown: Arc<AtomicBool>,
@@ -462,11 +347,6 @@ fn shard_manager(
         shard_args.push(quantize.to_string())
     }
 
-    if let Some(speculate) = speculate {
-        shard_args.push("--speculate".to_string());
-        shard_args.push(speculate.to_string())
-    }
-
     if let Some(dtype) = dtype {
         shard_args.push("--dtype".to_string());
         shard_args.push(dtype.to_string())
@@ -478,12 +358,6 @@ fn shard_manager(
         shard_args.push(revision)
     }
 
-    let rope = match (rope_scaling, rope_factor) {
-        (None, None) => None,
-        (Some(scaling), None) => Some((scaling, 1.0)),
-        (Some(scaling), Some(factor)) => Some((scaling, factor)),
-        (None, Some(factor)) => Some((RopeScaling::Linear, factor)),
-    };
     // OpenTelemetry
     if let Some(otlp_endpoint) = otlp_endpoint {
         shard_args.push("--otlp-endpoint".to_string());
@@ -498,7 +372,7 @@ fn shard_manager(
     envs.push(("WORLD_SIZE".into(), world_size.to_string().into()));
     envs.push(("MASTER_ADDR".into(), master_addr.into()));
     envs.push(("MASTER_PORT".into(), master_port.to_string().into()));
-    envs.push(("TORCH_NCCL_AVOID_RECORD_STREAMS".into(), "1".into()));
+    envs.push(("NCCL_ASYNC_ERROR_HANDLING".into(), "1".into()));
 
     // CUDA memory fraction
     envs.push((
@@ -508,9 +382,6 @@ fn shard_manager(
 
     // Safetensors load fast
     envs.push(("SAFETENSORS_FAST_GPU".into(), "1".into()));
-
-    // Disable progress bar
-    envs.push(("HF_HUB_DISABLE_PROGRESS_BARS".into(), "1".into()));
 
     // Enable hf transfer for insane download speeds
     let enable_hf_transfer = env::var("HF_HUB_ENABLE_HF_TRANSFER").unwrap_or("1".to_string());
@@ -523,15 +394,6 @@ fn shard_manager(
     if let Ok(api_token) = env::var("HF_API_TOKEN") {
         envs.push(("HUGGING_FACE_HUB_TOKEN".into(), api_token.into()))
     };
-
-    // Detect rope scaling
-    // Sending as env instead of CLI args to not bloat everything
-    // those only can be used by RoPE models, so passing information around
-    // for all models will complexify code unnecessarily
-    if let Some((scaling, factor)) = rope {
-        envs.push(("ROPE_SCALING".into(), scaling.to_string().into()));
-        envs.push(("ROPE_FACTOR".into(), factor.to_string().into()));
-    }
 
     // If huggingface_hub_cache is some, pass it to the shard
     // Useful when running inside a docker container
@@ -547,11 +409,6 @@ fn shard_manager(
             weights_cache_override.into(),
         ));
     };
-
-    // Enable experimental support for cuda graphs
-    if enable_cuda_graphs {
-        envs.push(("ENABLE_CUDA_GRAPHS".into(), "True".into()))
-    }
 
     // If disable_custom_kernels is true, pass it to the shard as an env var
     if disable_custom_kernels {
@@ -601,13 +458,6 @@ fn shard_manager(
     thread::spawn(move || {
         log_lines(shard_stdout_reader.lines());
     });
-    // We read stderr in another thread as it seems that lines() can block in some cases
-    let (err_sender, err_receiver) = mpsc::channel();
-    thread::spawn(move || {
-        for line in shard_stderr_reader.lines().flatten() {
-            err_sender.send(line).unwrap_or(());
-        }
-    });
 
     let mut ready = false;
     let start_time = Instant::now();
@@ -615,6 +465,13 @@ fn shard_manager(
     loop {
         // Process exited
         if let Some(exit_status) = p.try_wait().unwrap() {
+            // We read stderr in another thread as it seems that lines() can block in some cases
+            let (err_sender, err_receiver) = mpsc::channel();
+            thread::spawn(move || {
+                for line in shard_stderr_reader.lines().flatten() {
+                    err_sender.send(line).unwrap_or(());
+                }
+            });
             let mut err = String::new();
             while let Ok(line) = err_receiver.recv_timeout(Duration::from_millis(10)) {
                 err = err + "\n" + &line;
@@ -802,16 +659,8 @@ fn download_convert_model(args: &Args, running: Arc<AtomicBool>) -> Result<(), L
         download_args.push(revision.to_string())
     }
 
-    // Trust remote code for automatic peft fusion
-    if args.trust_remote_code {
-        download_args.push("--trust-remote-code".to_string());
-    }
-
     // Copy current process env
     let mut envs: Vec<(OsString, OsString)> = env::vars_os().collect();
-
-    // Disable progress bar
-    envs.push(("HF_HUB_DISABLE_PROGRESS_BARS".into(), "1".into()));
 
     // If huggingface_hub_cache is set, pass it to the download process
     // Useful when running inside a docker container
@@ -863,20 +712,12 @@ fn download_convert_model(args: &Args, running: Arc<AtomicBool>) -> Result<(), L
         }
     };
 
-    let download_stdout = BufReader::new(download_process.stdout.take().unwrap());
+    // Redirect STDOUT to the console
+    let download_stdout = download_process.stdout.take().unwrap();
+    let stdout = BufReader::new(download_stdout);
 
     thread::spawn(move || {
-        log_lines(download_stdout.lines());
-    });
-
-    let download_stderr = BufReader::new(download_process.stderr.take().unwrap());
-
-    // We read stderr in another thread as it seems that lines() can block in some cases
-    let (err_sender, err_receiver) = mpsc::channel();
-    thread::spawn(move || {
-        for line in download_stderr.lines().flatten() {
-            err_sender.send(line).unwrap_or(());
-        }
+        log_lines(stdout.lines());
     });
 
     loop {
@@ -887,10 +728,12 @@ fn download_convert_model(args: &Args, running: Arc<AtomicBool>) -> Result<(), L
             }
 
             let mut err = String::new();
-            while let Ok(line) = err_receiver.recv_timeout(Duration::from_millis(10)) {
-                err = err + "\n" + &line;
-            }
-
+            download_process
+                .stderr
+                .take()
+                .unwrap()
+                .read_to_string(&mut err)
+                .unwrap();
             if let Some(signal) = status.signal() {
                 tracing::error!(
                     "Download process was signaled to shutdown with signal {signal}: {err}"
@@ -934,23 +777,18 @@ fn spawn_shards(
         let shutdown_sender = shutdown_sender.clone();
         let otlp_endpoint = args.otlp_endpoint.clone();
         let quantize = args.quantize;
-        let speculate = args.speculate;
         let dtype = args.dtype;
         let trust_remote_code = args.trust_remote_code;
         let master_port = args.master_port;
         let disable_custom_kernels = args.disable_custom_kernels;
         let watermark_gamma = args.watermark_gamma;
         let watermark_delta = args.watermark_delta;
-        let enable_cuda_graphs = args.enable_cuda_graphs;
         let cuda_memory_fraction = args.cuda_memory_fraction;
-        let rope_scaling = args.rope_scaling;
-        let rope_factor = args.rope_factor;
         thread::spawn(move || {
             shard_manager(
                 model_id,
                 revision,
                 quantize,
-                speculate,
                 dtype,
                 trust_remote_code,
                 uds_path,
@@ -963,10 +801,7 @@ fn spawn_shards(
                 disable_custom_kernels,
                 watermark_gamma,
                 watermark_delta,
-                enable_cuda_graphs,
                 cuda_memory_fraction,
-                rope_scaling,
-                rope_factor,
                 otlp_endpoint,
                 status_sender,
                 shutdown,
@@ -1004,20 +839,7 @@ fn spawn_shards(
     Ok(())
 }
 
-fn compute_type(num_shard: usize) -> Option<String> {
-    let output = Command::new("nvidia-smi")
-        .args(["--query-gpu=gpu_name", "--format=csv"])
-        .output()
-        .ok()?;
-    let output = String::from_utf8(output.stdout).ok()?;
-    let fullname = output.split('\n').nth(1)?;
-    let cardname = fullname.replace(' ', "-").to_lowercase();
-    let compute_type = format!("{num_shard}-{cardname}");
-    Some(compute_type)
-}
-
 fn spawn_webserver(
-    num_shard: usize,
     args: Args,
     shutdown: Arc<AtomicBool>,
     shutdown_receiver: &mpsc::Receiver<()>,
@@ -1032,8 +854,6 @@ fn spawn_webserver(
         args.max_best_of.to_string(),
         "--max-stop-sequences".to_string(),
         args.max_stop_sequences.to_string(),
-        "--max-top-n-tokens".to_string(),
-        args.max_top_n_tokens.to_string(),
         "--max-input-length".to_string(),
         args.max_input_length.to_string(),
         "--max-total-tokens".to_string(),
@@ -1056,27 +876,10 @@ fn spawn_webserver(
         args.model_id,
     ];
 
-    // Grammar support
-    if args.disable_grammar_support {
-        router_args.push("--disable-grammar-support".to_string());
-    }
-
-    // Tokenizer config path
-    if let Some(ref tokenizer_config_path) = args.tokenizer_config_path {
-        router_args.push("--tokenizer-config-path".to_string());
-        router_args.push(tokenizer_config_path.to_string());
-    }
-
     // Model optional max batch total tokens
     if let Some(max_batch_total_tokens) = args.max_batch_total_tokens {
         router_args.push("--max-batch-total-tokens".to_string());
         router_args.push(max_batch_total_tokens.to_string());
-    }
-
-    // Router optional max batch size
-    if let Some(max_batch_size) = args.max_batch_size {
-        router_args.push("--max-batch-size".to_string());
-        router_args.push(max_batch_size.to_string());
     }
 
     // Model optional revision
@@ -1117,13 +920,6 @@ fn spawn_webserver(
     if let Ok(api_token) = env::var("HF_API_TOKEN") {
         envs.push(("HUGGING_FACE_HUB_TOKEN".into(), api_token.into()))
     };
-
-    // Parse Compute type
-    if let Ok(compute_type) = env::var("COMPUTE_TYPE") {
-        envs.push(("COMPUTE_TYPE".into(), compute_type.into()))
-    } else if let Some(compute_type) = compute_type(num_shard) {
-        envs.push(("COMPUTE_TYPE".into(), compute_type.into()))
-    }
 
     let mut webserver = match Command::new("text-generation-router")
         .args(router_args)
@@ -1318,8 +1114,8 @@ fn main() -> Result<(), LauncherError> {
         return Ok(());
     }
 
-    let mut webserver = spawn_webserver(num_shard, args, shutdown.clone(), &shutdown_receiver)
-        .map_err(|err| {
+    let mut webserver =
+        spawn_webserver(args, shutdown.clone(), &shutdown_receiver).map_err(|err| {
             shutdown_shards(shutdown.clone(), &shutdown_receiver);
             err
         })?;
