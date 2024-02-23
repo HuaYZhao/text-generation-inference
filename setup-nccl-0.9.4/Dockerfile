@@ -11,15 +11,10 @@ FROM nvidia/cuda:11.8.0-devel-ubuntu20.04 AS cuda
 FROM sakurahua/lm_inference:open-tgi-v0.9.4 AS base
 WORKDIR /app
 ENV CONDA_PACKAGES_PATH=/opt/conda/lib/python3.9/site-packages
-ARG PY_DIR=server/text_generation_server
 
 # COPY --from=chef /text-generation-inference/target/release/text-generation-launcher /usr/local/bin/text-generation-launcher-mpi
 COPY bin/text-generation-launcher /usr/local/bin/text-generation-launcher-mpi
 COPY comm_lib comm_lib
-COPY $PY_DIR/server.py $CONDA_PACKAGES_PATH/text_generation_server/
-COPY $PY_DIR/models/flash_llama.py $CONDA_PACKAGES_PATH/text_generation_server/models/
-COPY $PY_DIR/models/custom_modeling/flash_llama_modeling.py $CONDA_PACKAGES_PATH/text_generation_server/models/custom_modeling/
-COPY $PY_DIR/utils/layers.py $PY_DIR/utils/mpi_dist.py $CONDA_PACKAGES_PATH/text_generation_server/utils/
 
 # 配置apt
 RUN apt-get update && \
@@ -46,7 +41,12 @@ RUN cd comm_lib && python setup.py install
 
 FROM base
 WORKDIR /app
+ARG PY_DIR=server/text_generation_server
 COPY --from=optim $CONDA_PACKAGES_PATH/comm_lib* $CONDA_PACKAGES_PATH
+COPY $PY_DIR/server.py $CONDA_PACKAGES_PATH/text_generation_server/
+COPY $PY_DIR/models/flash_llama.py $CONDA_PACKAGES_PATH/text_generation_server/models/
+COPY $PY_DIR/models/custom_modeling/flash_llama_modeling.py $CONDA_PACKAGES_PATH/text_generation_server/models/custom_modeling/
+COPY $PY_DIR/utils/layers.py $PY_DIR/utils/mpi_dist.py $CONDA_PACKAGES_PATH/text_generation_server/utils/
 
 # 删除过期文件，减小镜像大小
 RUN mv /usr/local/bin/text-generation-launcher /usr/local/bin/text-generation-launcher-ori && \
