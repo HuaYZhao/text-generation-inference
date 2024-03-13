@@ -1,7 +1,7 @@
 # 如因网络问题无法编译，则从bin目录直接拷贝二进制文件
 # FROM lukemathwalker/cargo-chef:latest-rust-1.71 AS chef
 
-# RUN git clone https://github.com/huggingface/text-generation-inference.git -b v0.9.4
+# RUN git clone https://github.com/HuaYZhao/text-generation-inference.git -b v0.9.4
 # WORKDIR $pwd/text-generation-inference
 # COPY launcher/src/main.rs launcher/src/main.rs
 # RUN cd launcher && cargo build --release
