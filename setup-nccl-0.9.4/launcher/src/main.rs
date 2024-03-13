@@ -21,8 +21,32 @@ mod env_runtime;
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum Quantization {
-    Bitsandbytes,
+    /// 4 bit quantization. Requires a specific GTPQ quantized model:
+    ///   https://hf.co/models?search=awq.
+    /// Should replace GPTQ models whereever possible because of the better latency
+    Awq,
+    /// 8 bit quantization, doesn't require specific model.
+    /// Should be a drop-in replacement to bitsandbytes with much better performance.
+    /// Kernels are from https://github.com/NetEase-FuXi/EETQ.git
+    Eetq,
+    /// 4 bit quantization. Requires a specific GTPQ quantized model: https://hf.co/models?search=gptq.
+    /// text-generation-inference will use exllama (faster) kernels whereever possible, and use
+    /// triton kernel (wider support) when it's not.
+    /// AWQ has faster kernels.
     Gptq,
+    /// Bitsandbytes 8bit. Can be applied on any model, will cut the memory requirement in half,
+    /// but it is known that the model will be much slower to run than the native f16.
+    #[deprecated(
+        since = "1.1.0",
+        note = "Use `eetq` instead, which provides better latencies overall and is drop-in in most cases"
+    )]
+    Bitsandbytes,
+    /// Bitsandbytes 4bit. Can be applied on any model, will cut the memory requirement by 4x,
+    /// but it is known that the model will be much slower to run than the native f16.
+    BitsandbytesNF4,
+    /// Bitsandbytes 4bit. nf4 should be preferred in most cases but maybe this one has better
+    /// perplexity performance for you model
+    BitsandbytesFP4,
 }
 
 impl std::fmt::Display for Quantization {
@@ -32,8 +56,20 @@ impl std::fmt::Display for Quantization {
             Quantization::Bitsandbytes => {
                 write!(f, "bitsandbytes")
             }
+            Quantization::BitsandbytesNF4 => {
+                write!(f, "bitsandbytes-nf4")
+            }
+            Quantization::BitsandbytesFP4 => {
+                write!(f, "bitsandbytes-fp4")
+            }
             Quantization::Gptq => {
                 write!(f, "gptq")
+            }
+            Quantization::Awq => {
+                write!(f, "awq")
+            }
+            Quantization::Eetq => {
+                write!(f, "eetq")
             }
         }
     }
@@ -95,8 +131,7 @@ struct Args {
     #[clap(long, env)]
     num_shard: Option<usize>,
 
-    /// Whether you want the model to be quantized. This will use `bitsandbytes` for
-    /// quantization on the fly, or `gptq`.
+    /// Whether you want the model to be quantized.
     #[clap(long, env, value_enum)]
     quantize: Option<Quantization>,
 
@@ -663,6 +698,11 @@ fn download_convert_model(args: &Args, running: Arc<AtomicBool>) -> Result<(), L
     if let Some(revision) = &args.revision {
         download_args.push("--revision".to_string());
         download_args.push(revision.to_string())
+    }
+
+    // Trust remote code for automatic peft fusion
+    if args.trust_remote_code {
+        download_args.push("--trust-remote-code".to_string());
     }
 
     // Copy current process env

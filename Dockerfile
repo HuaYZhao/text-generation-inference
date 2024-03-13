@@ -65,7 +65,7 @@ RUN case ${TARGETPLATFORM} in \
          "linux/arm64")  MAMBA_ARCH=aarch64  ;; \
          *)              MAMBA_ARCH=x86_64   ;; \
     esac && \
-    curl -fsSL -v -o ~/mambaforge.sh -O  "https://github.com/conda-forge/miniforge/releases/download/${MAMBA_VERSION}/Mambaforge-${MAMBA_VERSION}-Linux-${MAMBA_ARCH}.sh"
+    curl -fsSL -v -o ~/mambaforge.sh -O  "https://mirror.ghproxy.com/github.com/conda-forge/miniforge/releases/download/${MAMBA_VERSION}/Mambaforge-${MAMBA_VERSION}-Linux-${MAMBA_ARCH}.sh"
 RUN chmod +x ~/mambaforge.sh && \
     bash ~/mambaforge.sh -b -p /opt/conda && \
     rm ~/mambaforge.sh
@@ -203,7 +203,7 @@ COPY server server
 COPY server/Makefile server/Makefile
 RUN cd server && \
     make gen-server && \
-    pip install -r requirements.txt && \
+    pip install -r requirements.txt --trusted-host mirrors.cloud.aliyuncs.com -i http://mirrors.cloud.aliyuncs.com/pypi/simple/ && \
     pip install ".[bnb, accelerate, quantize]" --no-cache-dir
 
 # Install benchmarker

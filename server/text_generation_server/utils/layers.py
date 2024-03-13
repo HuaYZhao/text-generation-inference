@@ -5,11 +5,13 @@ import torch.distributed
 from torch import nn
 from torch.nn import functional as F
 from typing import List
+from loguru import logger
+from functools import lru_cache
 
 HAS_BITS_AND_BYTES = True
 try:
     import bitsandbytes as bnb
-    from bitsandbytes.nn import Int8Params
+    from bitsandbytes.nn import Int8Params, Params4bit
 
 except ImportError:
     HAS_BITS_AND_BYTES = False
@@ -18,16 +20,38 @@ from accelerate import init_empty_weights
 
 from text_generation_server.utils.gptq.quant_linear import QuantLinear
 
-HAS_EXLLAMA = True
+
+HAS_AWQ = True
+try:
+    from text_generation_server.utils.awq.quantize.qmodule import WQLinear
+except ImportError:
+    HAS_AWQ = False
+
+try:
+    major, _minor = torch.cuda.get_device_capability()
+except Exception:
+    major = 1
+HAS_EXLLAMA = False
+CAN_EXLLAMA = major >= 8
 if os.getenv("DISABLE_EXLLAMA") == "True":
     HAS_EXLLAMA = False
-try:
-    from text_generation_server.utils.gptq.exllama import Ex4bitLinear
-except ImportError:
-    HAS_EXLLAMA = False
-
+elif CAN_EXLLAMA:
+    try:
+        from text_generation_server.utils.gptq.exllama import Ex4bitLinear
+    
+        HAS_EXLLAMA = True
+    except ImportError:
+        pass
+    
 from typing import Optional
 
+HAS_EETQ = False
+try:
+    from EETQ import quant_weights, w8_a16_gemm
+
+    HAS_EETQ = True
+except ImportError:
+    pass
 # Monkey patching
 @classmethod
 def load_layer_norm(cls, prefix, weights, eps):
@@ -80,6 +104,27 @@ class FastLinear(nn.Module):
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         return F.linear(input, self.weight, self.bias)
+
+
+class EETQLinear(nn.Module):
+    def __init__(
+        self,
+        weight,
+        bias,
+    ) -> None:
+        super().__init__()
+        device = weight.device
+        weight = torch.t(weight).contiguous().cpu()
+        weight, scale = quant_weights(weight, torch.int8, False)
+
+        self.weight = weight.cuda(device)
+        self.scale = scale.cuda(device)
+        self.bias = bias.cuda(device) if bias is not None else None
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        output = w8_a16_gemm(input, self.weight, self.scale)
+        output = output + self.bias if self.bias is not None else output
+        return output
 
 
 class Linear8bitLt(nn.Module):
@@ -140,10 +185,61 @@ class Linear8bitLt(nn.Module):
         return out
 
 
+class Linear4bit(nn.Module):
+    def __init__(self, weight, bias, quant_type):
+        super().__init__()
+        self.weight = Params4bit(
+            weight.data,
+            requires_grad=False,
+            compress_statistics=True,
+            quant_type=quant_type,
+        )
+        self.compute_dtype = None
+        self.weight.cuda(weight.device)
+        self.bias = bias
+
+    def forward(self, x: torch.Tensor):
+        # weights are cast automatically as Int8Params, but the bias has to be cast manually
+        if self.bias is not None and self.bias.dtype != x.dtype:
+            self.bias.data = self.bias.data.to(x.dtype)
+
+        if getattr(self.weight, "quant_state", None) is None:
+            print(
+                "FP4 quantization state not initialized. Please call .cuda() or .to(device) on the LinearFP4 layer first."
+            )
+        inp_dtype = x.dtype
+        if self.compute_dtype is not None:
+            x = x.to(self.compute_dtype)
+
+        bias = None if self.bias is None else self.bias.to(self.compute_dtype)
+        out = bnb.matmul_4bit(
+            x, self.weight.t(), bias=bias, quant_state=self.weight.quant_state
+        )
+
+        out = out.to(inp_dtype)
+
+        return out
+
+
+@lru_cache(1)
+def warn_deprecate_bnb():
+    logger.warning(
+        "Bitsandbytes 8bit is deprecated, using `eetq` is a drop-in replacement, and has much better performnce"
+    )
+
+
 def get_linear(weight, bias, quantize):
     if quantize is None:
         linear = FastLinear(weight, bias)
+    elif quantize == "eetq":
+        if HAS_EETQ:
+            linear = EETQLinear(weight, bias)
+        else:
+            raise ImportError(
+                "Please install EETQ from https://github.com/NetEase-FuXi/EETQ"
+            )
     elif quantize == "bitsandbytes":
+        warn_deprecate_bnb()
         linear = Linear8bitLt(
             weight,
             bias,
@@ -152,6 +248,18 @@ def get_linear(weight, bias, quantize):
         )
         if bias is not None:
             linear.bias = nn.Parameter(bias)
+    elif quantize == "bitsandbytes-fp4":
+        linear = Linear4bit(
+            weight,
+            bias,
+            quant_type="fp4",
+        )
+    elif quantize == "bitsandbytes-nf4":
+        linear = Linear4bit(
+            weight,
+            bias,
+            quant_type="nf4",
+        )
     elif quantize == "gptq":
         try:
             qweight, qzeros, scales, g_idx, bits, groupsize, use_exllama = weight
@@ -172,6 +280,21 @@ def get_linear(weight, bias, quantize):
                 bits,
                 groupsize,
             )
+    elif quantize == "awq":
+        try:
+            qweight, qzeros, scales, _, bits, groupsize, _ = weight
+        except Exception:
+            raise NotImplementedError(
+                f"The passed weight is not `awq` compatible, loader needs to be updated."
+            )
+        linear = WQLinear(
+            w_bit=bits,
+            group_size=groupsize,
+            qweight=qweight,
+            qzeros=qzeros,
+            scales=scales,
+            bias=bias is not None,
+        )
     else:
         raise NotImplementedError(f"Quantization `{quantize}` is not implemented yet.")
     return linear
@@ -207,8 +330,8 @@ class TensorParallelHead(SuperLayer):
             weight = weights.get_tensor(f"{prefix}.weight")
             should_gather = False
 
-        # GPTQ doesn't quantize heads (nor embeddings)
-        if config.quantize == "gptq":
+        # GPTQ,AWQ,EETQ don't quantize heads (nor embeddings)
+        if config.quantize in ["gptq", "awq", "eetq"]:
             quantize = None
         else:
             quantize = config.quantize
@@ -381,33 +504,59 @@ try:
     from flash_attn.layers.rotary import RotaryEmbedding
     import rotary_emb
 
-    class PositionRotaryEmbedding(nn.Module):
-        def __init__(self, inv_freq):
-            super().__init__()
+    def _create_inv_freq(dim, base, device):
+        inv_freq = 1.0 / (
+            base ** (torch.arange(0, dim, 2, device=device, dtype=torch.float32) / dim)
+        )
+        return inv_freq
 
+    def _get_rope_config(config):
+        if os.getenv("ROPE_SCALING", None) is not None:
+            rope_scaling = {
+                "type": os.environ["ROPE_SCALING"],
+                "factor": float(os.environ["ROPE_FACTOR"]),
+            }
+            return rope_scaling
+        return getattr(config, "rope_scaling", None)
+
+    class PositionRotaryEmbedding(nn.Module):
+        def __init__(self, inv_freq, scaling_factor):
+            super().__init__()
             self.inv_freq = inv_freq
             self._seq_len_cached = 0
             self._cos_cached = None
             self._sin_cached = None
             self._cos_k_cached = None
             self._sin_k_cached = None
+            self.scaling_factor = scaling_factor
+            self.dynamic_args = None
 
         @classmethod
-        def static(cls, dim, base, device):
-            inv_freq = 1.0 / (
-                base
-                ** (torch.arange(0, dim, 2, device=device, dtype=torch.float32) / dim)
-            )
-            return cls(inv_freq)
+        def static(cls, config, dim, base, device):
+            inv_freq = _create_inv_freq(dim, base, device)
+            scaling_factor = None
+            rope_scaling = _get_rope_config(config)
+            if rope_scaling is not None:
+                raise NotImplementedError(
+                    f"rope scaling type {rope_scaling['type']} is not implemented or invalid"
+                )
+            return cls(inv_freq, scaling_factor)
 
         @classmethod
-        def load(cls, prefix, weights):
+        def load(cls, config, prefix, weights):
             # XXX: Always load this in float32 !
             dtype = weights.dtype
             weights.dtype = torch.float32
             inv_freq = weights.get_tensor(f"{prefix}.inv_freq")
             weights.dtype = dtype
-            return cls(inv_freq)
+
+            scaling_factor = None
+            rope_scaling = _get_rope_config(config)
+            if rope_scaling is not None:
+                raise NotImplementedError(
+                    f"rope scaling type {rope_scaling['type']} is not implemented or invalid"
+                )
+            return cls(inv_freq, scaling_factor)
 
         def _update_cos_sin_cache(self, dtype, device, seqlen):
             # Reset the tables if the sequence length has changed,
@@ -419,8 +568,11 @@ try:
             ):
                 self._seq_len_cached = seqlen
                 t = torch.arange(seqlen, device=device, dtype=self.inv_freq.dtype)
+                if self.scaling_factor is not None:
+                    t /= self.scaling_factor
                 # Don't do einsum, it converts fp32 to fp16
                 # freqs = torch.einsum("i,j->ij", t, self.inv_freq)
+
                 freqs = torch.outer(t, self.inv_freq.to(device=t.device))
                 self._cos_cached = torch.cos(freqs).to(dtype)
                 self._sin_cached = torch.sin(freqs).to(dtype)
